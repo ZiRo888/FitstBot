@@ -1,8 +1,30 @@
+import os
 import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+
+# =====================================================================
+# 0. МИНИ ВЕБ-СЕРВЕР ДЛЯ RENDER (ЧТОБЫ НЕ БЫЛО ОШИБКИ PORT TIMEOUT)
+# =====================================================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running 24/7!")
+
+    def log_message(self, format, *args):
+        pass  # Отключаем лишний спам в логах
+
+def start_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    print(f"Веб-порт {port} открыт для Render!")
+    server.serve_forever()
+
 
 # =====================================================================
 # 1. НАСТРОЙКИ TELEGRAM (ТВОИ ДАННЫЕ)
@@ -39,6 +61,9 @@ def get_top_futures_symbols(limit=TOP_COINS_COUNT) -> list:
     url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
     try:
         resp = requests.get(url, timeout=10).json()
+        if not isinstance(resp, list):
+            print(f"Ответ Binance (проверь регион сервера): {resp}")
+            return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
         ignore = {"USDCUSDT", "BTCDOMUSDT", "DEFIUSDT"}
         usdt_pairs = [
             item for item in resp 
@@ -163,7 +188,6 @@ def check_smart_money_and_orderflow(symbol: str, interval: str):
         prev_high = df.iloc[-3]['high']
         prev_low = df.iloc[-3]['low']
 
-        # Проверка структуры FVG / Имбаланса Smart Money
         if curr['close'] > prev_high:
             msg = (
                 f"📐 <b>[FVG SMART MONEY | {interval.upper()}]</b>\n"
@@ -186,11 +210,15 @@ def check_smart_money_and_orderflow(symbol: str, interval: str):
 # 6. ГЛАВНЫЙ ЦИКЛ ОБХОДА РЫНКА
 # =====================================================================
 if __name__ == "__main__":
+    # 1. Запускаем веб-сервер в отдельном потоке для Render
+    threading.Thread(target=start_web_server, daemon=True).start()
+
+    # 2. Запускаем основную логику бота
     print("Загружаю список топ-монет Binance Futures...")
     top_symbols = get_top_futures_symbols()
     send_telegram(
-        f"🚀 <b>Комбо-бот запущен!</b>\n"
-        f"Активны алгоритмы: Mini Signals (топ-{len(top_symbols)} монет), FVG Smart Money и Order Flow.\n"
+        f"🚀 <b>Комбо-бот успешно запущен на сервере!</b>\n"
+        f"Активны алгоритмы: Mini Signals (монет в базе: {len(top_symbols)}), FVG Smart Money и Order Flow.\n"
         f"Таймфреймы: <b>5m, 15m, 1h, 4h, 1d</b>."
     )
 
@@ -202,26 +230,21 @@ if __name__ == "__main__":
         if now.minute % 5 == 0 and now.second >= 3 and now.minute != last_triggered_minute:
             last_triggered_minute = now.minute
             
-            # Сканирование 5m
             run_mini_signals_scan(top_symbols, "5m")
             check_smart_money_and_orderflow("BTCUSDT", "5m")
 
-            # Сканирование 15m
             if now.minute % 15 == 0:
                 run_mini_signals_scan(top_symbols, "15m")
                 check_smart_money_and_orderflow("BTCUSDT", "15m")
 
-            # Сканирование 1h
             if now.minute == 0:
                 run_mini_signals_scan(top_symbols, "1h")
                 check_smart_money_and_orderflow("BTCUSDT", "1h")
 
-                # Сканирование 4h
                 if now.hour % 4 == 0:
                     run_mini_signals_scan(top_symbols, "4h")
                     check_smart_money_and_orderflow("BTCUSDT", "4h")
 
-                # Сканирование 1d (Дневка)
                 if now.hour == 0:
                     run_mini_signals_scan(top_symbols, "1d")
                     check_smart_money_and_orderflow("BTCUSDT", "1d")
