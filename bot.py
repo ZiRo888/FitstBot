@@ -499,12 +499,18 @@ def load_market_data(client, market, tf, boundary):
     if (frame["oi"] <= 0).any():
         raise DataError("Некорректный Open Interest")
 
-    if (frame"long_liq", "short_liq" < 0).any().any():
+    # ← ЛИКВИДАЦИИ: двойные скобки, не одинарные
+    liq_check = frame[["long_liq", "short_liq"]]
+    if (liq_check < 0).any().any():
         raise DataError("Некорректные ликвидации")
 
+    # ← OHLC: тоже двойные скобки
+    ohlc_for_high = frame[["o", "c", "l"]].max(axis=1)
+    ohlc_for_low = frame[["o", "c", "h"]].min(axis=1)
+
     invalid_ohlc = (
-        (frame["h"] < frame"o", "c", "l".max(axis=1))
-        | (frame["l"] > frame"o", "c", "h".min(axis=1))
+        (frame["h"] < ohlc_for_high)
+        | (frame["l"] > ohlc_for_low)
         | (frame["c"] <= 0)
     )
 
