@@ -26,6 +26,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
 
+# Жёсткий список монет: BTC, ETH, SOL. Расширение — только через env.
 coins = [
     value.strip().upper()
     for value in os.getenv("WATCHLIST", "BTC,ETH,SOL").split(",")
@@ -56,6 +57,9 @@ OI_THRESHOLD = float(os.getenv("OI_CHANGE_PERCENT", "0.30"))
 VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", "1.50"))
 
 FUNDING_LIMIT = float(os.getenv("FUNDING_LIMIT_PERCENT", "0.05"))
+FUNDING_PCT_LIMIT = float(os.getenv("FUNDING_PCT_LIMIT", "0.90"))
+FUNDING_WINDOW = int(os.getenv("FUNDING_WINDOW_BARS", "96"))
+
 MIN_LIQ_USD = float(os.getenv("MIN_LIQUIDATION_USD", "10000"))
 LIQ_MULTIPLIER = float(os.getenv("LIQUIDATION_SPIKE_MULTIPLIER", "3.0"))
 
@@ -63,7 +67,11 @@ DATA_RETRY_SECONDS = 120
 TELEGRAM_RETRY_SECONDS = 60
 
 STATE_DB = os.getenv("STATE_DB", "bot_state.sqlite3")
-PREFERRED_EXCHANGE = os.getenv("PREFERRED_EXCHANGE", "").strip()
+
+# Жёсткая биржа: спот и перп только оттуда
+REQUIRED_EXCHANGE = os.getenv("REQUIRED_EXCHANGE", "Binance").strip() or "Binance"
+
+# Overrides имеют смысл только если хочется сменить символ НА ТОЙ ЖЕ бирже
 MARKET_OVERRIDES = json.loads(os.getenv("MARKET_OVERRIDES_JSON", "{}"))
 
 NL = chr(10)
@@ -80,6 +88,8 @@ HEALTH = {
     "last_cycle": None,
     "last_data_success": None,
     "last_error": None,
+    "exchange": REQUIRED_EXCHANGE,
+    "watchlist": WATCHLIST,
 }
 
 
@@ -130,7 +140,7 @@ class CoinalyzeClient:
 
     def wait_for_slot(self):
         # Один поток, один символ на запрос.
-        # Не более 30 запросов за окно 61 секунда.
+        # Не более 30 запросов за окно 61 секунда (лимит Coinalyze — 40/мин).
         while True:
             now = time.monotonic()
 
@@ -255,6 +265,11 @@ class CoinalyzeClient:
 
 
 def build_market_map(client):
+    """
+    Жёстко требуем, чтобы и спот, и перп были на REQUIRED_EXCHANGE.
+    Никаких fallback на другие биржи — иначе дельты спота и перпа
+    окажутся на разных рынках и станут несопоставимыми.
+    """
     spots = client.get("spot-markets")
     futures = client.get("future-markets")
     mapping = {}
@@ -269,6 +284,7 @@ def build_market_map(client):
             and market.get("is_perpetual") is True
             and market.get("has_ohlcv_data") is True
             and market.get("has_buy_sell_data") is True
+            and market.get("exchange") == REQUIRED_EXCHANGE
         ]
 
         spot_candidates = [
@@ -276,6 +292,7 @@ def build_market_map(client):
             if market.get("base_asset") == coin
             and market.get("quote_asset") == "USDT"
             and market.get("has_buy_sell_data") is True
+            and market.get("exchange") == REQUIRED_EXCHANGE
         ]
 
         if override.get("perp"):
@@ -292,32 +309,31 @@ def build_market_map(client):
 
         if not perps or not spot_candidates:
             raise DataError(
-                f"{coin}: не найдены Spot/Perp с buy/sell данными"
+                f"{coin}: на {REQUIRED_EXCHANGE} нет одновременно "
+                f"спота и перпа с buy/sell данными. "
+                f"Проверьте MARKET_OVERRIDES_JSON или расширьте WATCHLIST."
             )
 
         perps.sort(key=lambda market: (
-            bool(PREFERRED_EXCHANGE)
-            and market.get("exchange") != PREFERRED_EXCHANGE,
             not market.get("has_long_short_ratio_data", False),
             market["symbol"],
         ))
 
         perp = perps[0]
 
-        spot_candidates.sort(key=lambda market: (
-            market.get("exchange") != perp.get("exchange"),
-            market["symbol"],
-        ))
+        spot_candidates.sort(key=lambda market: market["symbol"])
+        spot = spot_candidates[0]
 
         mapping[coin] = {
-            "spot": spot_candidates[0],
+            "spot": spot,
             "perp": perp,
         }
 
         logger.info(
-            "%s | spot=%s | perp=%s | L/S=%s",
+            "%s | exchange=%s | spot=%s | perp=%s | L/S=%s",
             coin,
-            mapping[coin]["spot"]["symbol"],
+            REQUIRED_EXCHANGE,
+            spot["symbol"],
             perp["symbol"],
             perp.get("has_long_short_ratio_data", False),
         )
@@ -370,6 +386,15 @@ def add_indicators(frame):
     ).mean()
 
     return frame
+
+
+def rolling_pct(series, window):
+    """Percentile rank последнего значения внутри окна (0..1)."""
+    min_periods = max(10, window // 4)
+    return series.rolling(window, min_periods=min_periods).apply(
+        lambda x: float((x <= x[-1]).mean()) if len(x) > 0 else 0.5,
+        raw=True,
+    )
 
 
 def load_market_data(client, market, tf, boundary):
@@ -474,12 +499,12 @@ def load_market_data(client, market, tf, boundary):
     if (frame["oi"] <= 0).any():
         raise DataError("Некорректный Open Interest")
 
-    if (frame[["long_liq", "short_liq"]] < 0).any().any():
+    if (frame"long_liq", "short_liq" < 0).any().any():
         raise DataError("Некорректные ликвидации")
 
     invalid_ohlc = (
-        (frame["h"] < frame[["o", "c", "l"]].max(axis=1))
-        | (frame["l"] > frame[["o", "c", "h"]].min(axis=1))
+        (frame["h"] < frame"o", "c", "l".max(axis=1))
+        | (frame["l"] > frame"o", "c", "h".min(axis=1))
         | (frame["c"] <= 0)
     )
 
@@ -534,49 +559,64 @@ def get_context(frame):
     return "neutral"
 
 
-def detect_divergence(frame, bullish):
-    prices = (
-        frame["l"].to_numpy()
-        if bullish
-        else frame["h"].to_numpy()
-    )
+def detect_divergence(
+    frame,
+    bullish,
+    lookback=40,
+    order=2,
+    min_gap=3,
+    max_gap=15,
+    max_age=12,
+):
+    """
+    Адаптивный детектор дивергенции цены и Spot CVD.
+    Сканирует пары локальных экстремумов от новых к старым,
+    возвращает True при первом подтверждении.
+    """
+    if len(frame) < lookback:
+        return False
 
-    cvd = frame["spot_cvd"].to_numpy()
+    window = frame.iloc[-lookback:]
+    prices = (window["l"] if bullish else window["h"]).to_numpy()
+    cvd = window["spot_cvd"].to_numpy()
+    n = len(prices)
+
     pivots = []
+    for i in range(order, n - order):
+        left = prices[i - order:i]
+        right = prices[i + 1:i + 1 + order]
 
-    for index in range(max(2, len(frame) - 45), len(frame) - 2):
-        neighbours = np.concatenate([
-            prices[index - 2:index],
-            prices[index + 1:index + 3],
-        ])
-
-        is_pivot = (
-            prices[index] < neighbours.min()
-            if bullish
-            else prices[index] > neighbours.max()
-        )
-
-        if is_pivot:
-            pivots.append(index)
+        if bullish:
+            if prices[i] < left.min() and prices[i] < right.min():
+                pivots.append(i)
+        else:
+            if prices[i] > left.max() and prices[i] > right.max():
+                pivots.append(i)
 
     if len(pivots) < 2:
         return False
 
-    first, second = pivots[-2:]
+    for k in range(len(pivots) - 1, 0, -1):
+        i2 = pivots[k]
+        if n - 1 - i2 > max_age:
+            continue
 
-    if second - first < 3 or len(frame) - 1 - second > 7:
-        return False
+        for j in range(k - 1, -1, -1):
+            i1 = pivots[j]
+            gap = i2 - i1
+            if gap < min_gap:
+                continue
+            if gap > max_gap:
+                break
 
-    if bullish:
-        return bool(
-            prices[second] < prices[first]
-            and cvd[second] > cvd[first]
-        )
+            if bullish:
+                if prices[i2] < prices[i1] and cvd[i2] > cvd[i1]:
+                    return True
+            else:
+                if prices[i2] > prices[i1] and cvd[i2] < cvd[i1]:
+                    return True
 
-    return bool(
-        prices[second] > prices[first]
-        and cvd[second] < cvd[first]
-    )
+    return False
 
 
 # ============================================================
@@ -638,15 +678,24 @@ def analyze_orderflow(frame):
     bullish_divergence = detect_divergence(frame, True)
     bearish_divergence = detect_divergence(frame, False)
 
-    # Косвенные признаки возможного поглощения.
+    # Усиленное «поглощение»: нужно всё вместе — сильная противоположная
+    # дельта, повышенный объём, осмысленное тело свечи и цена в сторону
+    # поглощения.
+    body = float(current["c"] - current["o"])
+    body_abs = abs(body)
+
     bullish_absorption = (
-        current["perp_share"] < -0.10
-        and current["c"] >= previous["c"]
+        current["perp_share"] < -MIN_DELTA_SHARE * 2
+        and current["v"] > average_volume * 1.3
+        and body_abs > 0.4 * atr
+        and body > 0
     )
 
     bearish_absorption = (
-        current["perp_share"] > 0.10
-        and current["c"] <= previous["c"]
+        current["perp_share"] > MIN_DELTA_SHARE * 2
+        and current["v"] > average_volume * 1.3
+        and body_abs > 0.4 * atr
+        and body < 0
     )
 
     average_long_liq = frame["long_liq"].iloc[-31:-1].mean()
@@ -664,6 +713,13 @@ def analyze_orderflow(frame):
         > LIQ_MULTIPLIER * max(average_short_liq, 1.0)
     )
 
+    # Funding percentile (без look-ahead: последний бар окна).
+    funding = float(current["funding"])
+    funding_pct_series = rolling_pct(frame["funding"], FUNDING_WINDOW)
+    funding_pct = float(funding_pct_series.iloc[-1]) if pd.notna(
+        funding_pct_series.iloc[-1]
+    ) else 0.5
+
     candidates = []
     rejected = []
 
@@ -679,18 +735,6 @@ def analyze_orderflow(frame):
 
         if not spot_confirms:
             rejected.append(f"{direction}: Spot не подтверждает")
-            continue
-
-        funding = float(current["funding"])
-
-        funding_overheated = (
-            funding > FUNDING_LIMIT
-            if is_long
-            else funding < -FUNDING_LIMIT
-        )
-
-        if funding_overheated:
-            rejected.append(f"{direction}: funding вне лимита")
             continue
 
         if is_long:
@@ -726,6 +770,20 @@ def analyze_orderflow(frame):
 
         if not reversal and not impulse:
             rejected.append(f"{direction}: нет ценового сценария")
+            continue
+
+        # Funding блокирует ТОЛЬКО импульс в толпу.
+        # Reversal НЕ блокируется: перегрев funding = топливо для сквиза.
+        if impulse and is_long and funding > FUNDING_LIMIT and funding_pct > FUNDING_PCT_LIMIT:
+            rejected.append(
+                f"{direction}: funding перегрет (пробой в толпу лонгов)"
+            )
+            continue
+
+        if impulse and not is_long and funding < -FUNDING_LIMIT and funding_pct < (1 - FUNDING_PCT_LIMIT):
+            rejected.append(
+                f"{direction}: funding перегрет (пробой в толпу шортов)"
+            )
             continue
 
         setup = (
@@ -806,6 +864,7 @@ def analyze_orderflow(frame):
             "atr": atr,
             "oi_change": float(oi_change),
             "funding": funding,
+            "funding_pct": funding_pct,
             "spot_delta_pct": float(current["spot_share"] * 100),
             "perp_delta_pct": float(current["perp_share"] * 100),
             "long_liq": float(current["long_liq"]),
@@ -848,7 +907,7 @@ class StateStore:
         self.db.commit()
 
     def record(self, coin, tf, candle, result):
-        serialized = json.dumps(result, ensure_ascii=False)
+        serialized = json.dumps(result, ensure_ascii=False, default=str)
         now = int(time.time())
 
         self.db.execute(
@@ -993,6 +1052,7 @@ def format_signal(
         f"{emoji} <b>ORDER FLOW | {tf.upper()} {signal['direction']}</b>",
         "",
         f"Монета: <b>#{html.escape(coin)}USDT</b>",
+        f"Биржа: <b>{html.escape(REQUIRED_EXCHANGE)}</b> (spot + perp)",
         f"Цена закрытия: {signal['price']:,.4f}",
         f"Свеча закрылась: {closed_at}",
         f"Сетап: {html.escape(signal['setup'])}",
@@ -1002,15 +1062,15 @@ def format_signal(
         f"📊 Spot delta / volume: {signal['spot_delta_pct']:+.1f}%",
         f"📊 Perp delta / volume: {signal['perp_delta_pct']:+.1f}%",
         f"🏦 OI за 3 свечи: {signal['oi_change']:+.2f}%",
-        f"💰 Funding: {signal['funding']:+.4f}%",
+        f"💰 Funding: {signal['funding']:+.4f}% (pct={signal['funding_pct']:.2f})",
         f"💥 Ликвидации LONG: ${signal['long_liq']:,.0f}",
         f"💥 Ликвидации SHORT: ${signal['short_liq']:,.0f}",
         f"⚖️ Long/Short Ratio: {ratio_text}",
         f"📏 ATR(14): {signal['atr']:,.4f}",
         f"📐 FVG по направлению: {fvg_text}",
         "",
-        f"BTC: {context_names.get(btc_context, btc_context)}",
-        f"Старший ТФ: {context_names.get(higher_context, higher_context)}",
+        f"BTC (старший ТФ): {context_names.get(btc_context, btc_context)}",
+        f"Старший ТФ монеты: {context_names.get(higher_context, higher_context)}",
         "",
     ]
 
@@ -1021,11 +1081,10 @@ def format_signal(
 
     lines.extend([
         "",
-        "Источник: Coinalyze",
-        "Spot: " + html.escape(market["spot"]["symbol"]),
-        "Perp: " + html.escape(market["perp"]["symbol"]),
+        f"Spot: {html.escape(market['spot']['symbol'])}",
+        f"Perp: {html.escape(market['perp']['symbol'])}",
         (
-            "<i>Один рынок каждого типа, не агрегат всех бирж. "
+            "<i>Оба рынка с одной биржи. "
             "Уведомление о сетапе, не команда на вход.</i>"
         ),
     ])
@@ -1047,23 +1106,26 @@ def get_boundaries():
 
 
 def check_contexts(coin, tf, direction, cache, boundaries):
+    """
+    - BTC: контекст берётся со СТАРШЕГО ТФ (меньше шума от EMA20).
+    - BTC в одиночку НЕ блокирует (только soft-penalty в основном цикле).
+    - Жёсткий блок — только если BTC И старший ТФ монеты против.
+    """
     opposite = "bearish" if direction == "LONG" else "bullish"
-    btc_record = cache.get(("BTC", tf))
+
+    btc_tf = HIGHER_TIMEFRAME.get(tf, tf)
+    btc_context = "neutral"
 
     if coin != "BTC":
+        btc_record = cache.get(("BTC", btc_tf))
+
         if (
             btc_record is None
-            or btc_record["boundary"] != boundaries[tf]
+            or btc_record["boundary"] != boundaries[btc_tf]
         ):
             return "BTC-контекст отсутствует", None, None, True
 
-        if btc_record["context"] == opposite:
-            return (
-                "BTC-контекст против сигнала",
-                btc_record["context"],
-                None,
-                False,
-            )
+        btc_context = btc_record["context"]
 
     higher_tf = HIGHER_TIMEFRAME.get(tf)
     higher_context = "not_used"
@@ -1075,21 +1137,17 @@ def check_contexts(coin, tf, direction, cache, boundaries):
             higher_record is None
             or higher_record["boundary"] != boundaries[higher_tf]
         ):
-            return "Старший ТФ отсутствует", None, None, True
+            return "Старший ТФ отсутствует", btc_context, None, True
 
         higher_context = higher_record["context"]
 
-        if higher_context == opposite:
+        if higher_context == opposite and btc_context == opposite:
             return (
-                "Старший ТФ против сигнала",
-                None,
+                "BTC и старший ТФ против сигнала",
+                btc_context,
                 higher_context,
                 False,
             )
-
-    btc_context = (
-        btc_record["context"] if btc_record else "neutral"
-    )
 
     return None, btc_context, higher_context, False
 
@@ -1151,10 +1209,15 @@ def main():
 
     send_telegram(NL.join([
         "🚀 <b>Coinalyze Order Flow запущен</b>",
+        f"Биржа: <b>{html.escape(REQUIRED_EXCHANGE)}</b> (spot + perp)",
         "Монеты: " + ", ".join(WATCHLIST),
         "Таймфреймы: 15m, 1h, 4h",
         "Режим: " + mode,
-        "Первичная загрузка займёт несколько минут.",
+        (
+            "Funding блокирует только impulse в толпу. "
+            "BTC — со старшего ТФ, soft-penalty."
+        ),
+        "Первичная загрузка займёт ~2 минуты.",
     ]))
 
     HEALTH["status"] = "running"
@@ -1320,6 +1383,35 @@ def main():
                         processed.add(work_key)
 
                     continue
+
+                # Soft-penalty: BTC против, но старший ТФ монеты — за.
+                btc_opposite = (
+                    "bearish" if direction == "LONG" else "bullish"
+                )
+
+                if (
+                    btc_context == btc_opposite
+                    and higher_context != btc_opposite
+                ):
+                    signal["score"] -= 1
+                    signal["reasons"].append(
+                        "⚠️ BTC-контекст против (штраф −1)"
+                    )
+
+                    if signal["score"] < MIN_SCORE:
+                        state.record(
+                            coin,
+                            tf,
+                            candle,
+                            {
+                                "skip": (
+                                    "BTC против, score упал ниже порога"
+                                ),
+                                "candidate": signal,
+                            },
+                        )
+                        processed.add(work_key)
+                        continue
 
                 if state.already_sent(
                     coin, tf, direction, candle
