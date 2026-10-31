@@ -26,7 +26,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
 
-# Жёсткий список монет: BTC, ETH, SOL. Расширение — только через env.
 coins = [
     value.strip().upper()
     for value in os.getenv("WATCHLIST", "BTC,ETH,SOL").split(",")
@@ -68,10 +67,7 @@ TELEGRAM_RETRY_SECONDS = 60
 
 STATE_DB = os.getenv("STATE_DB", "bot_state.sqlite3")
 
-# Жёсткая биржа: спот и перп только оттуда
 REQUIRED_EXCHANGE = os.getenv("REQUIRED_EXCHANGE", "Binance").strip() or "Binance"
-
-# Overrides имеют смысл только если хочется сменить символ НА ТОЙ ЖЕ бирже
 MARKET_OVERRIDES = json.loads(os.getenv("MARKET_OVERRIDES_JSON", "{}"))
 
 NL = chr(10)
@@ -139,8 +135,6 @@ class CoinalyzeClient:
         self.last_call = 0.0
 
     def wait_for_slot(self):
-        # Один поток, один символ на запрос.
-        # Не более 30 запросов за окно 61 секунда (лимит Coinalyze — 40/мин).
         while True:
             now = time.monotonic()
 
@@ -264,64 +258,95 @@ class CoinalyzeClient:
         return frame.loc[frame.index + seconds <= boundary]
 
 
+def _norm(value):
+    return str(value or "").strip().lower()
+
+
 def build_market_map(client):
     """
     Жёстко требуем, чтобы и спот, и перп были на REQUIRED_EXCHANGE.
-    Никаких fallback на другие биржи — иначе дельты спота и перпа
-    окажутся на разных рынках и станут несопоставимыми.
+    Фильтр has_buy_sell_data убран — на Binance он может быть не выставлен,
+    хотя сами данные bv в ohlcv-history приходят.
+    Диагностика при ошибке покажет, что реально вернул API.
     """
     spots = client.get("spot-markets")
     futures = client.get("future-markets")
     mapping = {}
 
+    target = _norm(REQUIRED_EXCHANGE)
+
+    available_exchanges = sorted({
+        m.get("exchange") for m in futures if m.get("exchange")
+    })
+    logger.info("Coinalyze exchanges (futures): %s", available_exchanges)
+
     for coin in WATCHLIST:
         override = MARKET_OVERRIDES.get(coin, {})
 
         perps = [
-            market for market in futures
-            if market.get("base_asset") == coin
-            and market.get("quote_asset") == "USDT"
-            and market.get("is_perpetual") is True
-            and market.get("has_ohlcv_data") is True
-            and market.get("has_buy_sell_data") is True
-            and market.get("exchange") == REQUIRED_EXCHANGE
+            m for m in futures
+            if _norm(m.get("exchange")) == target
+            and m.get("base_asset") == coin
+            and m.get("quote_asset") == "USDT"
+            and bool(m.get("is_perpetual"))
+            and bool(m.get("has_ohlcv_data"))
         ]
 
         spot_candidates = [
-            market for market in spots
-            if market.get("base_asset") == coin
-            and market.get("quote_asset") == "USDT"
-            and market.get("has_buy_sell_data") is True
-            and market.get("exchange") == REQUIRED_EXCHANGE
+            m for m in spots
+            if _norm(m.get("exchange")) == target
+            and m.get("base_asset") == coin
+            and m.get("quote_asset") == "USDT"
         ]
 
         if override.get("perp"):
             perps = [
-                market for market in perps
-                if market["symbol"] == override["perp"]
+                m for m in perps if m["symbol"] == override["perp"]
             ]
 
         if override.get("spot"):
             spot_candidates = [
-                market for market in spot_candidates
-                if market["symbol"] == override["spot"]
+                m for m in spot_candidates
+                if m["symbol"] == override["spot"]
             ]
 
         if not perps or not spot_candidates:
-            raise DataError(
-                f"{coin}: на {REQUIRED_EXCHANGE} нет одновременно "
-                f"спота и перпа с buy/sell данными. "
-                f"Проверьте MARKET_OVERRIDES_JSON или расширьте WATCHLIST."
+            all_binance_perps = [
+                m["symbol"] for m in futures
+                if _norm(m.get("exchange")) == target
+                and m.get("base_asset") == coin
+            ]
+            all_binance_spots = [
+                m["symbol"] for m in spots
+                if _norm(m.get("exchange")) == target
+                and m.get("base_asset") == coin
+            ]
+
+            logger.error(
+                "DEBUG %s | perps=%s | spots=%s | "
+                "binance_perps_all=%s | binance_spots_all=%s",
+                coin,
+                [m["symbol"] for m in perps],
+                [m["symbol"] for m in spot_candidates],
+                all_binance_perps[:10],
+                all_binance_spots[:10],
             )
 
-        perps.sort(key=lambda market: (
-            not market.get("has_long_short_ratio_data", False),
-            market["symbol"],
+            raise DataError(
+                f"{coin}: на {REQUIRED_EXCHANGE} нет одновременно "
+                f"спота и перпа. "
+                f"perps={len(perps)}, spots={len(spot_candidates)}. "
+                f"Смотрите DEBUG выше в логах."
+            )
+
+        perps.sort(key=lambda m: (
+            not bool(m.get("has_long_short_ratio_data")),
+            m["symbol"],
         ))
 
         perp = perps[0]
 
-        spot_candidates.sort(key=lambda market: market["symbol"])
+        spot_candidates.sort(key=lambda m: m["symbol"])
         spot = spot_candidates[0]
 
         mapping[coin] = {
@@ -332,7 +357,7 @@ def build_market_map(client):
         logger.info(
             "%s | exchange=%s | spot=%s | perp=%s | L/S=%s",
             coin,
-            REQUIRED_EXCHANGE,
+            spot.get("exchange"),
             spot["symbol"],
             perp["symbol"],
             perp.get("has_long_short_ratio_data", False),
@@ -389,7 +414,6 @@ def add_indicators(frame):
 
 
 def rolling_pct(series, window):
-    """Percentile rank последнего значения внутри окна (0..1)."""
     min_periods = max(10, window // 4)
     return series.rolling(window, min_periods=min_periods).apply(
         lambda x: float((x <= x[-1]).mean()) if len(x) > 0 else 0.5,
@@ -499,12 +523,10 @@ def load_market_data(client, market, tf, boundary):
     if (frame["oi"] <= 0).any():
         raise DataError("Некорректный Open Interest")
 
-    # ← ЛИКВИДАЦИИ: двойные скобки, не одинарные
     liq_check = frame[["long_liq", "short_liq"]]
     if (liq_check < 0).any().any():
         raise DataError("Некорректные ликвидации")
 
-    # ← OHLC: тоже двойные скобки
     ohlc_for_high = frame[["o", "c", "l"]].max(axis=1)
     ohlc_for_low = frame[["o", "c", "h"]].min(axis=1)
 
@@ -574,11 +596,6 @@ def detect_divergence(
     max_gap=15,
     max_age=12,
 ):
-    """
-    Адаптивный детектор дивергенции цены и Spot CVD.
-    Сканирует пары локальных экстремумов от новых к старым,
-    возвращает True при первом подтверждении.
-    """
     if len(frame) < lookback:
         return False
 
@@ -684,9 +701,6 @@ def analyze_orderflow(frame):
     bullish_divergence = detect_divergence(frame, True)
     bearish_divergence = detect_divergence(frame, False)
 
-    # Усиленное «поглощение»: нужно всё вместе — сильная противоположная
-    # дельта, повышенный объём, осмысленное тело свечи и цена в сторону
-    # поглощения.
     body = float(current["c"] - current["o"])
     body_abs = abs(body)
 
@@ -719,7 +733,6 @@ def analyze_orderflow(frame):
         > LIQ_MULTIPLIER * max(average_short_liq, 1.0)
     )
 
-    # Funding percentile (без look-ahead: последний бар окна).
     funding = float(current["funding"])
     funding_pct_series = rolling_pct(frame["funding"], FUNDING_WINDOW)
     funding_pct = float(funding_pct_series.iloc[-1]) if pd.notna(
@@ -751,7 +764,6 @@ def analyze_orderflow(frame):
             breakout = current["c"] > prior_high + 0.1 * atr
             reversal_liq = long_liq_spike
             impulse_liq = short_liq_spike
-
         else:
             recovery = (
                 current["c"] < current["o"]
@@ -778,8 +790,6 @@ def analyze_orderflow(frame):
             rejected.append(f"{direction}: нет ценового сценария")
             continue
 
-        # Funding блокирует ТОЛЬКО импульс в толпу.
-        # Reversal НЕ блокируется: перегрев funding = топливо для сквиза.
         if impulse and is_long and funding > FUNDING_LIMIT and funding_pct > FUNDING_PCT_LIMIT:
             rejected.append(
                 f"{direction}: funding перегрет (пробой в толпу лонгов)"
@@ -1112,11 +1122,6 @@ def get_boundaries():
 
 
 def check_contexts(coin, tf, direction, cache, boundaries):
-    """
-    - BTC: контекст берётся со СТАРШЕГО ТФ (меньше шума от EMA20).
-    - BTC в одиночку НЕ блокирует (только soft-penalty в основном цикле).
-    - Жёсткий блок — только если BTC И старший ТФ монеты против.
-    """
     opposite = "bearish" if direction == "LONG" else "bullish"
 
     btc_tf = HIGHER_TIMEFRAME.get(tf, tf)
@@ -1390,7 +1395,6 @@ def main():
 
                     continue
 
-                # Soft-penalty: BTC против, но старший ТФ монеты — за.
                 btc_opposite = (
                     "bearish" if direction == "LONG" else "bullish"
                 )
