@@ -68,7 +68,6 @@ TELEGRAM_RETRY_SECONDS = 60
 STATE_DB = os.getenv("STATE_DB", "bot_state.sqlite3")
 
 # Coinalyze возвращает КОД биржи ('A' = Binance), а не название.
-# Оставляем 'A' как основной, но в фильтре проверяем и 'Binance'.
 REQUIRED_EXCHANGE = os.getenv("REQUIRED_EXCHANGE", "A").strip() or "A"
 MARKET_OVERRIDES = json.loads(os.getenv("MARKET_OVERRIDES_JSON", "{}"))
 
@@ -270,12 +269,36 @@ def _is_required_exchange(market_exchange):
     return False
 
 
+def exchange_display_name():
+    """Coinalyze отдаёт коды ('A'=Binance). Показываем человеку имя."""
+    mapping = {
+        "A": "Binance",
+        "B": "Bybit",
+        "C": "Coinbase",
+        "F": "FTX",
+        "H": "HTX",
+        "K": "Kraken",
+        "O": "OKX",
+        "S": "Gate.io",
+        "T": "Bitget",
+        "W": "WOO",
+        "Y": "Crypto.com",
+        "1": "BitMEX",
+        "2": "Bitfinex",
+        "3": "Bitstamp",
+        "4": "Bittrex",
+        "6": "Huobi",
+        "7": "KuCoin",
+        "8": "MEXC",
+    }
+    return mapping.get(REQUIRED_EXCHANGE, REQUIRED_EXCHANGE)
+
+
 def build_market_map(client):
     """
     Жёстко требуем, чтобы и спот, и перп были на REQUIRED_EXCHANGE.
-    Сравниваем и код ('A'), и полное название ('Binance').
-    has_buy_sell_data больше не фильтруем — на Binance флаг может не стоять,
-    хотя данные bv в ohlcv-history приходят.
+    Спот обязательно в USDT — иначе можно взять BTCUSD.A вместо BTCUSDT.A.
+    has_buy_sell_data не фильтруем — на Binance флаг может не стоять.
     """
     spots = client.get("spot-markets")
     futures = client.get("future-markets")
@@ -303,6 +326,8 @@ def build_market_map(client):
             if _is_required_exchange(m.get("exchange"))
             and m.get("base_asset") == coin
             and m.get("quote_asset") == "USDT"
+            # Жёстко требуем USDT в символе — иначе попадётся BTCUSD.A
+            and "USDT" in str(m.get("symbol", "")).upper()
         ]
 
         if override.get("perp"):
@@ -340,7 +365,7 @@ def build_market_map(client):
 
             raise DataError(
                 f"{coin}: на {REQUIRED_EXCHANGE} нет одновременно "
-                f"спота и перпа. "
+                f"спота и перпа в USDT. "
                 f"perps={len(perps)}, spots={len(spot_candidates)}. "
                 f"Смотрите DEBUG выше."
             )
@@ -1074,7 +1099,7 @@ def format_signal(
         f"{emoji} <b>ORDER FLOW | {tf.upper()} {signal['direction']}</b>",
         "",
         f"Монета: <b>#{html.escape(coin)}USDT</b>",
-        f"Биржа: <b>{html.escape(REQUIRED_EXCHANGE)}</b> (spot + perp)",
+        f"Биржа: <b>{html.escape(exchange_display_name())}</b> (spot + perp)",
         f"Цена закрытия: {signal['price']:,.4f}",
         f"Свеча закрылась: {closed_at}",
         f"Сетап: {html.escape(signal['setup'])}",
@@ -1226,7 +1251,7 @@ def main():
 
     send_telegram(NL.join([
         "🚀 <b>Coinalyze Order Flow запущен</b>",
-        f"Биржа: <b>{html.escape(REQUIRED_EXCHANGE)}</b> (spot + perp)",
+        f"Биржа: <b>{html.escape(exchange_display_name())}</b> (spot + perp)",
         "Монеты: " + ", ".join(WATCHLIST),
         "Таймфреймы: 15m, 1h, 4h",
         "Режим: " + mode,
