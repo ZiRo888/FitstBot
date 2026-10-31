@@ -67,7 +67,9 @@ TELEGRAM_RETRY_SECONDS = 60
 
 STATE_DB = os.getenv("STATE_DB", "bot_state.sqlite3")
 
-REQUIRED_EXCHANGE = os.getenv("REQUIRED_EXCHANGE", "Binance").strip() or "Binance"
+# Coinalyze возвращает КОД биржи ('A' = Binance), а не название.
+# Оставляем 'A' как основной, но в фильтре проверяем и 'Binance'.
+REQUIRED_EXCHANGE = os.getenv("REQUIRED_EXCHANGE", "A").strip() or "A"
 MARKET_OVERRIDES = json.loads(os.getenv("MARKET_OVERRIDES_JSON", "{}"))
 
 NL = chr(10)
@@ -258,22 +260,26 @@ class CoinalyzeClient:
         return frame.loc[frame.index + seconds <= boundary]
 
 
-def _norm(value):
-    return str(value or "").strip().lower()
+def _is_required_exchange(market_exchange):
+    """Coinalyze может отдавать код ('A') или название ('Binance')."""
+    value = str(market_exchange or "").strip()
+    if value == REQUIRED_EXCHANGE:
+        return True
+    if REQUIRED_EXCHANGE == "A" and value == "Binance":
+        return True
+    return False
 
 
 def build_market_map(client):
     """
     Жёстко требуем, чтобы и спот, и перп были на REQUIRED_EXCHANGE.
-    Фильтр has_buy_sell_data убран — на Binance он может быть не выставлен,
-    хотя сами данные bv в ohlcv-history приходят.
-    Диагностика при ошибке покажет, что реально вернул API.
+    Сравниваем и код ('A'), и полное название ('Binance').
+    has_buy_sell_data больше не фильтруем — на Binance флаг может не стоять,
+    хотя данные bv в ohlcv-history приходят.
     """
     spots = client.get("spot-markets")
     futures = client.get("future-markets")
     mapping = {}
-
-    target = _norm(REQUIRED_EXCHANGE)
 
     available_exchanges = sorted({
         m.get("exchange") for m in futures if m.get("exchange")
@@ -285,7 +291,7 @@ def build_market_map(client):
 
         perps = [
             m for m in futures
-            if _norm(m.get("exchange")) == target
+            if _is_required_exchange(m.get("exchange"))
             and m.get("base_asset") == coin
             and m.get("quote_asset") == "USDT"
             and bool(m.get("is_perpetual"))
@@ -294,7 +300,7 @@ def build_market_map(client):
 
         spot_candidates = [
             m for m in spots
-            if _norm(m.get("exchange")) == target
+            if _is_required_exchange(m.get("exchange"))
             and m.get("base_asset") == coin
             and m.get("quote_asset") == "USDT"
         ]
@@ -311,32 +317,32 @@ def build_market_map(client):
             ]
 
         if not perps or not spot_candidates:
-            all_binance_perps = [
+            all_perps = [
                 m["symbol"] for m in futures
-                if _norm(m.get("exchange")) == target
+                if _is_required_exchange(m.get("exchange"))
                 and m.get("base_asset") == coin
             ]
-            all_binance_spots = [
+            all_spots = [
                 m["symbol"] for m in spots
-                if _norm(m.get("exchange")) == target
+                if _is_required_exchange(m.get("exchange"))
                 and m.get("base_asset") == coin
             ]
 
             logger.error(
                 "DEBUG %s | perps=%s | spots=%s | "
-                "binance_perps_all=%s | binance_spots_all=%s",
+                "all_perps=%s | all_spots=%s",
                 coin,
                 [m["symbol"] for m in perps],
                 [m["symbol"] for m in spot_candidates],
-                all_binance_perps[:10],
-                all_binance_spots[:10],
+                all_perps[:10],
+                all_spots[:10],
             )
 
             raise DataError(
                 f"{coin}: на {REQUIRED_EXCHANGE} нет одновременно "
                 f"спота и перпа. "
                 f"perps={len(perps)}, spots={len(spot_candidates)}. "
-                f"Смотрите DEBUG выше в логах."
+                f"Смотрите DEBUG выше."
             )
 
         perps.sort(key=lambda m: (
