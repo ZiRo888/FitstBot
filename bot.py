@@ -205,7 +205,8 @@ class CoinalyzeClient:
                 except ValueError:
                     delay = 60
 
-                logger.warning("Coinalyze 429. Waiting %.1f sec", delay)
+                # ДОБАВЛЕН ЛОГ ДЛЯ ДИАГНОСТИКИ 429 ОШИБКИ
+                logger.warning("Coinalyze 429 | Лимит API | Сплю %.1f секунд", delay)
                 time.sleep(max(1, delay))
                 continue
 
@@ -1113,6 +1114,9 @@ def _fetch_raw(client, endpoint, symbol, tf, start_t, end_t, columns, usd=False)
     }
     if usd:
         params["convert_to_usd"] = "true"
+
+    # ДОБАВЛЕН ЛОГ ДЛЯ ОТСЛЕЖИВАНИЯ ТЕКУЩЕГО ЗАПРОСА
+    logger.info("  Запрос %s для %s...", endpoint, symbol)
 
     result = client.get(endpoint, params)
     entry = next((x for x in result if x.get("symbol") == symbol), None)
