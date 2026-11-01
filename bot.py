@@ -71,6 +71,9 @@ STATE_DB = os.getenv("STATE_DB", "bot_state.sqlite3")
 REQUIRED_EXCHANGE = os.getenv("REQUIRED_EXCHANGE", "A").strip() or "A"
 MARKET_OVERRIDES = json.loads(os.getenv("MARKET_OVERRIDES_JSON", "{}"))
 
+# Приоритет спота: Binance (A), затем OKX (O), Bybit (B), Coinbase (C)
+SPOT_FALLBACK_EXCHANGES = ["A", "O", "B", "C"]
+
 NL = chr(10)
 
 logging.basicConfig(
@@ -269,36 +272,23 @@ def _is_required_exchange(market_exchange):
     return False
 
 
-def exchange_display_name():
-    """Coinalyze отдаёт коды ('A'=Binance). Показываем человеку имя."""
+def exchange_name(code):
+    """Coinalyze exchange code -> human name."""
     mapping = {
-        "A": "Binance",
-        "B": "Bybit",
-        "C": "Coinbase",
-        "F": "FTX",
-        "H": "HTX",
-        "K": "Kraken",
-        "O": "OKX",
-        "S": "Gate.io",
-        "T": "Bitget",
-        "W": "WOO",
-        "Y": "Crypto.com",
-        "1": "BitMEX",
-        "2": "Bitfinex",
-        "3": "Bitstamp",
-        "4": "Bittrex",
-        "6": "Huobi",
-        "7": "KuCoin",
-        "8": "MEXC",
+        "A": "Binance", "B": "Bybit", "C": "Coinbase", "F": "FTX",
+        "H": "HTX", "K": "Kraken", "O": "OKX", "S": "Gate.io",
+        "T": "Bitget", "W": "WOO", "Y": "Crypto.com",
+        "1": "BitMEX", "2": "Bitfinex", "3": "Bitstamp",
+        "4": "Bittrex", "6": "Huobi", "7": "KuCoin", "8": "MEXC",
     }
-    return mapping.get(REQUIRED_EXCHANGE, REQUIRED_EXCHANGE)
+    return mapping.get(str(code or "").strip(), str(code or "?"))
 
 
 def build_market_map(client):
     """
-    Жёстко требуем, чтобы и спот, и перп были на REQUIRED_EXCHANGE.
-    Спот обязательно в USDT — иначе можно взять BTCUSD.A вместо BTCUSDT.A.
-    has_buy_sell_data не фильтруем — на Binance флаг может не стоять.
+    Перп — всегда Binance (A), USDT.
+    Спот — сначала Binance (A), потом OKX (O), Bybit (B), Coinbase (C).
+    Всегда USDT. Если USDT нет нигде — ошибка с понятным логом.
     """
     spots = client.get("spot-markets")
     futures = client.get("future-markets")
@@ -321,76 +311,65 @@ def build_market_map(client):
             and bool(m.get("has_ohlcv_data"))
         ]
 
-        spot_candidates = [
-            m for m in spots
-            if _is_required_exchange(m.get("exchange"))
-            and m.get("base_asset") == coin
-            and m.get("quote_asset") == "USDT"
-            # Жёстко требуем USDT в символе — иначе попадётся BTCUSD.A
-            and "USDT" in str(m.get("symbol", "")).upper()
-        ]
-
         if override.get("perp"):
-            perps = [
-                m for m in perps if m["symbol"] == override["perp"]
-            ]
+            perps = [m for m in perps if m["symbol"] == override["perp"]]
+
+        spot = None
+        spot_warning = None
 
         if override.get("spot"):
-            spot_candidates = [
-                m for m in spot_candidates
-                if m["symbol"] == override["spot"]
+            matches = [
+                m for m in spots if m.get("symbol") == override["spot"]
             ]
+            if matches:
+                spot = matches[0]
+        else:
+            for ex_code in SPOT_FALLBACK_EXCHANGES:
+                candidates = [
+                    m for m in spots
+                    if str(m.get("exchange", "")).strip() == ex_code
+                    and m.get("base_asset") == coin
+                    and m.get("quote_asset") == "USDT"
+                    and "USDT" in str(m.get("symbol", "")).upper()
+                ]
+                if candidates:
+                    spot = sorted(candidates, key=lambda m: m["symbol"])[0]
+                    if ex_code != "A":
+                        spot_warning = (
+                            f"{coin}: USDT-спот на Binance не найден, "
+                            f"использую {exchange_name(ex_code)} "
+                            f"({spot['symbol']})"
+                        )
+                    break
 
-        if not perps or not spot_candidates:
-            all_perps = [
-                m["symbol"] for m in futures
-                if _is_required_exchange(m.get("exchange"))
-                and m.get("base_asset") == coin
-            ]
-            all_spots = [
-                m["symbol"] for m in spots
-                if _is_required_exchange(m.get("exchange"))
-                and m.get("base_asset") == coin
-            ]
-
+        if not perps or not spot:
             logger.error(
-                "DEBUG %s | perps=%s | spots=%s | "
-                "all_perps=%s | all_spots=%s",
+                "DEBUG %s | perps=%s | spot=%s",
                 coin,
                 [m["symbol"] for m in perps],
-                [m["symbol"] for m in spot_candidates],
-                all_perps[:10],
-                all_spots[:10],
+                spot["symbol"] if spot else None
+            )
+            raise DataError(
+                f"{coin}: перп USDT на Binance (A) или спот USDT "
+                f"ни на одной из {SPOT_FALLBACK_EXCHANGES} не найден."
             )
 
-            raise DataError(
-                f"{coin}: на {REQUIRED_EXCHANGE} нет одновременно "
-                f"спота и перпа в USDT. "
-                f"perps={len(perps)}, spots={len(spot_candidates)}. "
-                f"Смотрите DEBUG выше."
-            )
+        if spot_warning:
+            logger.warning(spot_warning)
 
         perps.sort(key=lambda m: (
             not bool(m.get("has_long_short_ratio_data")),
             m["symbol"],
         ))
-
         perp = perps[0]
 
-        spot_candidates.sort(key=lambda m: m["symbol"])
-        spot = spot_candidates[0]
-
-        mapping[coin] = {
-            "spot": spot,
-            "perp": perp,
-        }
+        mapping[coin] = {"spot": spot, "perp": perp}
 
         logger.info(
-            "%s | exchange=%s | spot=%s | perp=%s | L/S=%s",
+            "%s | spot=%s (%s) | perp=%s (%s) | L/S=%s",
             coin,
-            spot.get("exchange"),
-            spot["symbol"],
-            perp["symbol"],
+            spot["symbol"], exchange_name(spot.get("exchange")),
+            perp["symbol"], exchange_name(perp.get("exchange")),
             perp.get("has_long_short_ratio_data", False),
         )
 
@@ -1071,6 +1050,17 @@ def send_telegram(text):
     return False
 
 
+def _exchange_line(market):
+    sp = exchange_name(market["spot"].get("exchange"))
+    pp = exchange_name(market["perp"].get("exchange"))
+    if sp == pp:
+        return f"Биржа: <b>{html.escape(sp)}</b> (spot + perp)"
+    return (
+        f"Спот: <b>{html.escape(sp)}</b> | "
+        f"Перп: <b>{html.escape(pp)}</b>"
+    )
+
+
 def format_signal(
     coin, tf, candle, signal, btc_context, higher_context, market
 ):
@@ -1099,7 +1089,7 @@ def format_signal(
         f"{emoji} <b>ORDER FLOW | {tf.upper()} {signal['direction']}</b>",
         "",
         f"Монета: <b>#{html.escape(coin)}USDT</b>",
-        f"Биржа: <b>{html.escape(exchange_display_name())}</b> (spot + perp)",
+        _exchange_line(market),
         f"Цена закрытия: {signal['price']:,.4f}",
         f"Свеча закрылась: {closed_at}",
         f"Сетап: {html.escape(signal['setup'])}",
@@ -1131,8 +1121,7 @@ def format_signal(
         f"Spot: {html.escape(market['spot']['symbol'])}",
         f"Perp: {html.escape(market['perp']['symbol'])}",
         (
-            "<i>Оба рынка с одной биржи. "
-            "Уведомление о сетапе, не команда на вход.</i>"
+            "<i>Уведомление о сетапе, не команда на вход.</i>"
         ),
     ])
 
@@ -1249,9 +1238,19 @@ def main():
         else "LIVE: отправка в Telegram"
     )
 
+    ex_lines = []
+    for c in WATCHLIST:
+        sp = exchange_name(market_map[c]["spot"].get("exchange"))
+        pp = exchange_name(market_map[c]["perp"].get("exchange"))
+        if sp == pp:
+            ex_lines.append(f"  {c}: {pp}")
+        else:
+            ex_lines.append(f"  {c}: спот {sp}, перп {pp}")
+
     send_telegram(NL.join([
         "🚀 <b>Coinalyze Order Flow запущен</b>",
-        f"Биржа: <b>{html.escape(exchange_display_name())}</b> (spot + perp)",
+        "Биржи:",
+        *ex_lines,
         "Монеты: " + ", ".join(WATCHLIST),
         "Таймфреймы: 15m, 1h, 4h",
         "Режим: " + mode,
