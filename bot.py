@@ -74,6 +74,10 @@ MARKET_OVERRIDES = json.loads(os.getenv("MARKET_OVERRIDES_JSON", "{}"))
 # Приоритет спота: Binance (A), затем OKX (O), Bybit (B), Coinbase (C)
 SPOT_FALLBACK_EXCHANGES = ["A", "O", "B", "C"]
 
+# Сколько свечей отставания и пропусков допустимо в загруженной истории
+MAX_DATA_LAG_BARS = int(os.getenv("MAX_DATA_LAG_BARS", "3"))
+MAX_DATA_GAPS = int(os.getenv("MAX_DATA_GAPS", "3"))
+
 NL = chr(10)
 
 logging.basicConfig(
@@ -431,7 +435,7 @@ def rolling_pct(series, window):
     )
 
 
-def load_market_data(client, market, tf, boundary):
+def load_market_data(client, market, tf, boundary, coin="?"):
     perp_symbol = market["perp"]["symbol"]
     spot_symbol = market["spot"]["symbol"]
 
@@ -509,13 +513,47 @@ def load_market_data(client, market, tf, boundary):
             f"Недостаточно синхронизированных свечей: {len(frame)}"
         )
 
-    if int(frame.index[-1]) != boundary - seconds:
-        raise DataError("Последняя закрытая свеча ещё недоступна")
+    # --- СМЯГЧЁННЫЕ ПРОВЕРКИ АКТУАЛЬНОСТИ ---
+    # Последняя свеча должна быть ЗАКРЫТА и не слишком старая.
+    # Разрешаем отставание до MAX_DATA_LAG_BARS — Coinalyze часто отдаёт
+    # с задержкой в 1 свечу на 1h/4h.
+    last_candle_open = int(frame.index[-1])
+    last_candle_close = last_candle_open + seconds
 
-    if not np.all(
-        np.diff(frame.index[-REQUIRED_BARS:].to_numpy()) == seconds
-    ):
-        raise DataError("Пропуски временных интервалов")
+    if last_candle_close > boundary:
+        raise DataError(
+            f"Последняя свеча ещё не закрыта "
+            f"(open={last_candle_open}, boundary={boundary})"
+        )
+
+    lag_bars = (boundary - last_candle_close) // seconds
+    if lag_bars > MAX_DATA_LAG_BARS:
+        raise DataError(
+            f"Данные устарели на {lag_bars} свечей "
+            f"(boundary={boundary}, last_close={last_candle_close})"
+        )
+
+    if lag_bars > 0:
+        logger.warning(
+            "DATA LAG | %s %s | отставание %s свечей "
+            "(boundary=%s, last=%s)",
+            coin, tf, lag_bars, boundary, last_candle_open,
+        )
+
+    # Пропуски: разрешаем до MAX_DATA_GAPS, чтобы не падать на микродырах API.
+    diffs = np.diff(frame.index[-REQUIRED_BARS:].to_numpy())
+    n_gaps = int((diffs != seconds).sum())
+
+    if n_gaps > MAX_DATA_GAPS:
+        raise DataError(
+            f"Пропуски временных интервалов: {n_gaps} из {len(diffs)}"
+        )
+
+    if n_gaps > 0:
+        logger.warning(
+            "DATA GAPS | %s %s | %s пропусков (использую как есть)",
+            coin, tf, n_gaps,
+        )
 
     for total, buy in [
         ("v", "bv"),
@@ -1290,6 +1328,7 @@ def main():
                         market_map[coin],
                         tf,
                         boundary,
+                        coin=coin,
                     )
 
                     cache[key] = {
