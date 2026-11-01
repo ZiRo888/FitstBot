@@ -1247,23 +1247,23 @@ def run_backtest():
     old_min = MIN_SCORE
     MIN_SCORE = BACKTEST_MIN_SCORE
 
-    print("\n" + "=" * 74)
-    print(
+    logger.info("=" * 74)
+    logger.info(
         f"BACKTEST | days={BACKTEST_DAYS} | TFs={BACKTEST_TFS} | "
         f"MIN_SCORE={BACKTEST_MIN_SCORE}"
     )
-    print(
+    logger.info(
         f"TP={BACKTEST_TP_ATR}ATR | SL={BACKTEST_SL_ATR}ATR | "
         f"MaxBars={BACKTEST_MAX_BARS}"
     )
-    print("=" * 74)
+    logger.info("=" * 74)
 
     client = CoinalyzeClient()
 
     try:
         market_map = build_market_map(client)
     except (DataError, AuthenticationError) as exc:
-        print(f"Не удалось построить market_map: {exc}")
+        logger.error(f"Не удалось построить market_map: {exc}")
         MIN_SCORE = old_min
         return
 
@@ -1273,19 +1273,21 @@ def run_backtest():
         for tf in BACKTEST_TFS:
             if tf not in TIMEFRAMES:
                 continue
-            print(f"\n--- {coin} {tf} ---")
+            
+            logger.info(f"--- {coin} {tf} --- ЗАГРУЗКА...")
+            
             try:
                 frame = load_backtest_frame(
                     client, market_map[coin], tf, BACKTEST_DAYS
                 )
             except DataError as exc:
-                print(f"  SKIP: {exc}")
+                logger.warning(f"  SKIP: {exc}")
                 continue
             except Exception as exc:
-                print(f"  ERROR: {type(exc).__name__}: {exc}")
+                logger.error(f"  ERROR: {type(exc).__name__}: {exc}")
                 continue
 
-            print(f"  Загружено {len(frame)} баров")
+            logger.info(f"  Загружено {len(frame)} баров. Анализ...")
 
             last_signal = {}
             signals = 0
@@ -1330,53 +1332,53 @@ def run_backtest():
                     "bars_held": int(bars),
                 })
 
-            print(f"  Сигналов: {signals}")
+            logger.info(f"  Сигналов: {signals}")
 
     MIN_SCORE = old_min
 
     if not all_trades:
-        print("\n=== НЕТ СДЕЛОК ===")
-        print("Порог score слишком высок или данных мало.")
+        logger.info("=== НЕТ СДЕЛОК ===")
+        logger.info("Порог score слишком высок или данных мало.")
         return
 
     try:
         pd.DataFrame(all_trades).to_csv("backtest_trades.csv", index=False)
-        print("\nСделки сохранены в backtest_trades.csv")
+        logger.info("Сделки сохранены в backtest_trades.csv")
     except Exception:
         pass
 
     overall = _summary(all_trades)
-    print("\n" + "=" * 74)
-    print("BACKTEST SUMMARY")
-    print("=" * 74)
-    print(_fmt("ALL", overall))
+    logger.info("=" * 74)
+    logger.info("BACKTEST SUMMARY")
+    logger.info("=" * 74)
+    logger.info(_fmt("ALL", overall))
 
-    print("\n--- По ТФ ---")
+    logger.info("--- По ТФ ---")
     for tf in BACKTEST_TFS:
-        print(_fmt(tf, _summary([t for t in all_trades if t["tf"] == tf])))
+        logger.info(_fmt(tf, _summary([t for t in all_trades if t["tf"] == tf])))
 
-    print("\n--- По score ---")
+    logger.info("--- По score ---")
     for sc in sorted(set(t["score"] for t in all_trades)):
-        print(_fmt(f"score {sc}",
+        logger.info(_fmt(f"score {sc}",
                    _summary([t for t in all_trades if t["score"] == sc])))
 
-    print("\n--- По монете ---")
+    logger.info("--- По монете ---")
     for coin in WATCHLIST:
-        print(_fmt(coin,
+        logger.info(_fmt(coin,
                    _summary([t for t in all_trades if t["coin"] == coin])))
 
-    print("\n--- По направлению ---")
+    logger.info("--- По направлению ---")
     for dirn in ["LONG", "SHORT"]:
-        print(_fmt(dirn,
+        logger.info(_fmt(dirn,
                    _summary([t for t in all_trades
                              if t["direction"] == dirn])))
 
-    print("\n--- По сетапу ---")
+    logger.info("--- По сетапу ---")
     for stp in sorted(set(t["setup"] for t in all_trades)):
-        print(_fmt(stp[:24],
+        logger.info(_fmt(stp[:24],
                    _summary([t for t in all_trades if t["setup"] == stp])))
 
-    print("=" * 74)
+    logger.info("=" * 74)
 
 
 # ============================================================
