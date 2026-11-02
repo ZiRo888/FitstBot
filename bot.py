@@ -27,7 +27,7 @@ DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
 
 coins = [
     value.strip().upper()
-    for value in os.getenv("WATCHLIST", "BTC").split(",")  # ТОЛЬКО BTC!
+    for value in os.getenv("WATCHLIST", "BTC").split(",")
     if value.strip()
 ]
 
@@ -412,7 +412,9 @@ def main():
     market_map = build_market_map(client)
 
     while True:
-        boundaries = {tf: (int(time.time()) - CLOSE_DELAY // s[0]) * s[0] for tf, s in TIMEFRAMES.items()}
+        # ИСПРАВЛЕНО: добавлены скобки для правильного округления времени
+        boundaries = {tf: ((int(time.time()) - CLOSE_DELAY) // s[0]) * s[0] for tf, s in TIMEFRAMES.items()}
+        
         for tf in LOAD_ORDER:
             for coin in WATCHLIST:
                 key = (coin, tf)
