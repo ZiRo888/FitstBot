@@ -14,7 +14,7 @@ import pandas as pd
 import requests
 
 # ============================================================
-# НАСТРОЙКИ (БОТ ТОЛЬКО ДЛЯ BTC)
+# НАСТРОЙКИ (БОТ ДЛЯ BTC, СПОТ С OKX)
 # ============================================================
 
 API_BASE = "https://api.coinalyze.net/v1"
@@ -24,9 +24,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
 
 COIN = "BTC"
-# Символы для Binance (A)
-PERP_SYMBOL = "BTCUSDT_PERP.A"
-SPOT_SYMBOL = "BTCUSDT.A"
+# ПЕРПЕТУАЛ БЕРЕМ С BINANCE (A), СПОТ С OKX (O)
+PERP_SYMBOL = "BTCUSDT_PERP.A" 
+SPOT_SYMBOL = "BTCUSDT.O" 
 
 TIMEFRAMES = {
     "15m": (900, "15min"),
@@ -37,7 +37,7 @@ TIMEFRAMES = {
 LOAD_ORDER = ["4h", "1h", "15m"]
 HIGHER_TIMEFRAME = {"15m": "1h", "1h": "4h"}
 
-LOOKBACK_BARS = 200 # Увеличили для EMA200
+LOOKBACK_BARS = 200 
 REQUIRED_BARS = 210
 
 CLOSE_DELAY = int(os.getenv("CLOSE_DELAY_SECONDS", "45"))
@@ -45,10 +45,10 @@ MAX_SIGNAL_DELAY = int(os.getenv("MAX_SIGNAL_DELAY_SECONDS", "600"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "7"))
 COOLDOWN_BARS = int(os.getenv("COOLDOWN_BARS", "2"))
 
-MIN_DELTA_SHARE = 0.12  # Для BTC перевес должен быть явным
-OI_THRESHOLD = 0.15     # Для BTC 0.15% за 3 свечи - это уже движ
+MIN_DELTA_SHARE = 0.12  
+OI_THRESHOLD = 0.15     
 VOLUME_MULTIPLIER = 1.50
-FUNDING_LIMIT = 0.03    # 0.03% для BTC - это уже перегрев
+FUNDING_LIMIT = 0.03    
 FUNDING_PCT_LIMIT = 0.90
 MAX_DATA_LAG_BARS = 3
 MAX_DATA_GAPS = 3
@@ -145,7 +145,7 @@ class CoinalyzeClient:
         return frame.drop_duplicates("t").set_index("t").sort_index()
 
 # ============================================================
-# ИНДИКАТОРЫ И ЛОГИКА (ЯДРО БОТА)
+# ИНДИКАТОРЫ И ЛОГИКА
 # ============================================================
 def add_indicators(frame):
     frame = frame.copy()
@@ -156,7 +156,7 @@ def add_indicators(frame):
     frame["spot_share"] = frame["spot_delta"] / frame["spot_volume"].replace(0, np.nan)
     frame["perp_share"] = frame["perp_delta"] / frame["v"].replace(0, np.nan)
 
-    # Базис (Фьючерс минус Спот)
+    # Базис (Фьючерс Binance минус Спот OKX)
     frame["basis"] = (frame["c"] - frame["spot_close"]) / frame["spot_close"] * 100
 
     # ATR
@@ -171,7 +171,6 @@ def add_indicators(frame):
 
 def get_context(frame):
     current = frame.iloc[-1]
-    # Более стабильный контекст для BTC
     if current["c"] > current["ema200"] and current["ema20"] > current["ema200"]:
         return "bullish"
     if current["c"] < current["ema200"] and current["ema20"] < current["ema200"]:
@@ -191,7 +190,6 @@ def detect_divergence(frame, bullish, lookback=40, order=2, min_gap=3, max_gap=1
     for i in range(order, n - order):
         left = prices[i - order:i]
         right = prices[i + 1:i + 1 + order]
-        # Требуем подтверждение объемом на пивоте (правка 8)
         if volumes[i] < avg_vol * 1.1: continue 
 
         if bullish and prices[i] < left.min() and prices[i] < right.min():
@@ -213,12 +211,14 @@ def detect_divergence(frame, bullish, lookback=40, order=2, min_gap=3, max_gap=1
     return False
 
 def load_market_data(client, tf, boundary):
+    # Загружаем перп с Binance (A), спот с OKX (O)
     perp = client.history("ohlcv-history", PERP_SYMBOL, tf, boundary, ["o", "h", "l", "c", "v", "bv"])
     spot = client.history("ohlcv-history", SPOT_SYMBOL, tf, boundary, ["v", "bv", "c"])
     oi = client.history("open-interest-history", PERP_SYMBOL, tf, boundary, ["c"])
     funding = client.history("funding-rate-history", PERP_SYMBOL, tf, boundary, ["c"])
     liquidations = client.history("liquidation-history", PERP_SYMBOL, tf, boundary, ["l", "s"], usd=True)
     
+    # Джоиним по времени (t)
     frame = perp.join(spot.rename(columns={"v": "spot_volume", "bv": "spot_buy_volume", "c": "spot_close"}), how="inner")
     frame = frame.join(oi.rename(columns={"c": "oi"}), how="inner")
     frame = frame.join(funding.rename(columns={"c": "funding"}), how="inner")
@@ -226,9 +226,9 @@ def load_market_data(client, tf, boundary):
     
     seconds = TIMEFRAMES[tf][0]
     if len(frame) < REQUIRED_BARS:
-        raise Exception(f"Недостаточно данных: {len(frame)}")
+        raise Exception(f"Недостаточно синхронизированных данных: {len(frame)} свечей")
     
-    # L/S Ratio
+    # L/S Ratio (Binance)
     frame["ls_ratio"] = np.nan
     try:
         ratio = client.history("long-short-ratio-history", PERP_SYMBOL, tf, boundary, ["r"])
@@ -274,7 +274,6 @@ def analyze_orderflow(frame):
     bullish_absorption = current["perp_share"] < -MIN_DELTA_SHARE*2 and body > 0.4*atr and body > 0
     bearish_absorption = current["perp_share"] > MIN_DELTA_SHARE*2 and body < -0.4*atr and body < 0
 
-    # Динамический порог ликвидаций (правка 4)
     avg_long_liq = frame["long_liq"].iloc[-31:-1].mean()
     avg_short_liq = frame["short_liq"].iloc[-31:-1].mean()
     long_liq_spike = current["long_liq"] > 3.0 * max(avg_long_liq, 10000)
@@ -283,7 +282,6 @@ def analyze_orderflow(frame):
     funding = float(current["funding"])
     ratio = float(current["ls_ratio"]) if pd.notna(current["ls_ratio"]) else None
     
-    # Динамическое окно фандинга (правка 7)
     funding_window_bars = max(10, int(96 * 900 / TIMEFRAMES[tf][0]))
     funding_pct = float((frame["funding"].iloc[-funding_window_bars:] <= funding).mean())
 
@@ -305,13 +303,13 @@ def analyze_orderflow(frame):
             breakout = current["c"] > prior_high + 0.1 * atr
             reversal_liq = long_liq_spike
             impulse_liq = short_liq_spike
-            basis_confirms = current["basis"] < 0.05 # Базис не перегрет
+            basis_confirms = current["basis"] < 0.05 
         else:
             recovery = current["c"] < current["o"] and current["c"] < previous["c"]
             breakout = current["c"] < prior_low - 0.1 * atr
             reversal_liq = short_liq_spike
             impulse_liq = long_liq_spike
-            basis_confirms = current["basis"] > 0.15 # Базис перегрет в лонгах
+            basis_confirms = current["basis"] > 0.15 
 
         reversal = bool(recovery and (sweep or divergence) and (absorption or oi_flush or reversal_liq))
         impulse = bool(breakout and perp_confirms and oi_buildup and high_volume)
@@ -319,7 +317,6 @@ def analyze_orderflow(frame):
         if not reversal and not impulse:
             rejected.append(f"{direction}: нет сценария"); continue
 
-        # Фильтр перегретого фандинга для пробоя
         if impulse and is_long and funding > FUNDING_LIMIT and funding_pct > FUNDING_PCT_LIMIT:
             rejected.append(f"LONG: фандинг перегрет"); continue
         if impulse and not is_long and funding < -FUNDING_LIMIT and funding_pct < (1 - FUNDING_PCT_LIMIT):
@@ -329,17 +326,16 @@ def analyze_orderflow(frame):
         score = 5
         reasons = [f"Spot CVD подтверждает (Share: {current['spot_share']*100:.1f}%)"]
 
-        # L/S Ratio Score (правка 3)
         ls_score = 0
         if ratio is not None:
             if is_long:
                 if ratio < 0.8: ls_score = 2
                 elif ratio < 1.0: ls_score = 1
-                elif ratio > 1.8: ls_score = -2 # Штраф за лонг в толпе
+                elif ratio > 1.8: ls_score = -2
             else:
                 if ratio > 1.5: ls_score = 2
                 elif ratio > 1.2: ls_score = 1
-                elif ratio < 0.7: ls_score = -2 # Штраф за шорт в толпе
+                elif ratio < 0.7: ls_score = -2
             score += ls_score
             if ls_score != 0:
                 reasons.append(f"L/S Ratio: {ratio:.2f} (Оценка: {ls_score:+})")
@@ -350,7 +346,6 @@ def analyze_orderflow(frame):
         if high_volume: score += 1; reasons.append("Объем выше среднего")
         if (reversal and reversal_liq) or (impulse and impulse_liq): score += 1; reasons.append("Всплеск ликвидаций")
         
-        # Фандинг на разворот (правка 6)
         if reversal:
             if is_long and funding < -0.01: score += 1; reasons.append("Фандинг отрицательный (шорты платят)")
             if not is_long and funding > 0.02: score += 1; reasons.append("Фандинг положительный")
@@ -413,7 +408,7 @@ def format_signal(tf, signal, context, higher_context):
         f"Баллы: {signal['score']}/12",
         "",
         f"📊 L/S Ratio: {ratio_text}",
-        f"⚖️ Базис: {signal['basis']:.3f}%",
+        f"⚖️ Базис (Binance/OKX): {signal['basis']:.3f}%",
         f"🏦 OI за 3 свечи: {signal['oi_change']:+.2f}%",
         f"💰 Funding: {signal['funding']:+.4f}%",
         "",
@@ -441,14 +436,13 @@ def main():
     cache = {}
     data_retry_after = {}
 
-    send_telegram("🚀 <b>BTC Order Flow Bot запущен</b>\nРежим: " + ("DRY RUN" if DRY_RUN else "LIVE"))
+    send_telegram("🚀 <b>BTC Order Flow Bot запущен</b>\nСпот: OKX | Перп: Binance\nРежим: " + ("DRY RUN" if DRY_RUN else "LIVE"))
     HEALTH["status"] = "running"
 
     while True:
         boundaries = get_boundaries()
         cycle_errors = False
 
-        # Загрузка данных
         for tf in LOAD_ORDER:
             boundary = boundaries[tf]
             existing = cache.get(tf)
@@ -466,14 +460,13 @@ def main():
                 data_retry_after[tf] = time.time() + 120
                 logger.error(f"Data error {tf}: {exc}")
 
-        # Анализ сигналов (только на 15m)
         tf = "15m"
         record = cache.get(tf)
         if record and record["boundary"] == boundaries[tf]:
             frame = record["frame"]
             candle = int(frame.index[-1])
             
-            if not state.already_sent("ANY", candle): # Проверяем, не отправляли ли за эту свечу
+            if not state.already_sent("ANY", candle): 
                 candidates, explanation = analyze_orderflow(frame)
                 
                 if len(candidates) == 1:
@@ -481,14 +474,13 @@ def main():
                     dir = signal["direction"]
                     
                     if not state.already_sent(dir, candle):
-                        # Проверка старшего ТФ
                         h1_ctx = cache.get("1h", {}).get("context", "neutral")
                         h4_ctx = cache.get("4h", {}).get("context", "neutral")
                         
                         msg = format_signal(tf, signal, h4_ctx, h1_ctx)
                         if send_telegram(msg):
                             state.mark_sent(dir, candle)
-                            state.mark_sent("ANY", candle) # Блокируем любые другие сигналы на этой свече
+                            state.mark_sent("ANY", candle) 
                             logger.info(f"Signal sent: {dir} | Score: {signal['score']}")
 
         HEALTH["last_cycle"] = int(time.time())
