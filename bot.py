@@ -18,7 +18,7 @@ import requests
 # НАСТРОЙКИ
 # ============================================================
 
-BYBIT_API = "https://api.bybit.com"
+OKX_API = "https://www.okx.com/api/v5"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -33,10 +33,11 @@ coins = [
 
 WATCHLIST = list(dict.fromkeys(["BTC"] + coins))
 
+# Таймфреймы OKX: 15m, 1H, 4H
 TIMEFRAMES = {
-    "15m": (900, "15"),
-    "1h": (3600, "60"),
-    "4h": (14400, "240"),
+    "15m": (900, "15m"),
+    "1h": (3600, "1H"),
+    "4h": (14400, "4H"),
 }
 
 LOAD_ORDER = ["4h", "1h", "15m"]
@@ -66,13 +67,19 @@ TELEGRAM_RETRY_SECONDS = 60
 
 STATE_DB = os.getenv("STATE_DB", "bot_state.sqlite3")
 
+# --- Бэктест ---
 RUN_BACKTEST = os.getenv("RUN_BACKTEST", "false").strip().lower() == "true"
 BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "30"))
 BACKTEST_TP_ATR = float(os.getenv("BACKTEST_TP_ATR", "1.5"))
 BACKTEST_SL_ATR = float(os.getenv("BACKTEST_SL_ATR", "1.0"))
 BACKTEST_MAX_BARS = int(os.getenv("BACKTEST_MAX_BARS", "30"))
-BACKTEST_TFS = [t.strip() for t in os.getenv("BACKTEST_TFS", "1h,4h").split(",") if t.strip()]
-BACKTEST_MIN_SCORE = int(os.getenv("BACKTEST_MIN_SCORE", os.getenv("MIN_SCORE", "5")))
+BACKTEST_TFS = [
+    t.strip() for t in os.getenv("BACKTEST_TFS", "1h,4h").split(",")
+    if t.strip()
+]
+BACKTEST_MIN_SCORE = int(
+    os.getenv("BACKTEST_MIN_SCORE", os.getenv("MIN_SCORE", "5"))
+)
 
 NL = chr(10)
 
@@ -91,6 +98,7 @@ HEALTH = {
     "watchlist": WATCHLIST,
 }
 
+
 # ============================================================
 # HEALTH-СЕРВЕР & ПИНГЕР
 # ============================================================
@@ -106,15 +114,19 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+
 def start_health_server():
     port = int(os.getenv("PORT", "10000"))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     logger.info("Health server: port %s", port)
     server.serve_forever()
 
+
 def self_ping_worker():
     url = os.getenv("RENDER_EXTERNAL_URL", "https://fitstbot.onrender.com/")
-    if not url.endswith("/"): url += "/"
+    if not url.endswith("/"):
+        url += "/"
+    
     while True:
         try:
             res = requests.get(url, timeout=10)
@@ -125,19 +137,19 @@ def self_ping_worker():
 
 
 # ============================================================
-# BYBIT API CLIENT
+# OKX API CLIENT
 # ============================================================
 
 class DataError(Exception):
     pass
 
-class BybitClient:
+class OkxClient:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"Accept": "application/json"})
 
     def get(self, endpoint, params=None):
-        url = f"{BYBIT_API}{endpoint}"
+        url = f"{OKX_API}{endpoint}"
         for attempt in range(4):
             try:
                 response = self.session.get(url, params=params, timeout=15)
@@ -147,7 +159,7 @@ class BybitClient:
                 continue
 
             if response.status_code == 429:
-                logger.warning("Bybit rate limit. Sleeping 10 sec.")
+                logger.warning("OKX rate limit. Sleeping 10 sec.")
                 time.sleep(10)
                 continue
                 
@@ -164,37 +176,35 @@ class BybitClient:
                 time.sleep(2 ** attempt)
                 continue
 
-            if result.get("retCode") != 0:
-                raise DataError(f"Bybit API Error: {result.get('retMsg')}")
+            if result.get("code") != "0":
+                raise DataError(f"OKX API Error: {result.get('msg')}")
 
-            return result.get("result", {})
+            return result.get("data", [])
 
         raise DataError(f"{endpoint}: exhausted retries")
 
 
-def fetch_bybit_klines(client, category, symbol, tf, start_ms, end_ms):
-    endpoint = "/v5/market/kline"
+def fetch_okx_candles(client, inst_id, tf, start_ms, end_ms):
+    endpoint = "/market/history-candles"
     params = {
-        "category": category, "symbol": symbol,
-        "interval": TIMEFRAMES[tf][1], "start": start_ms,
-        "end": end_ms, "limit": 1000
+        "instId": inst_id,
+        "bar": TIMEFRAMES[tf][1],
+        "after": end_ms,
+        "before": start_ms,
+        "limit": 100
     }
     res = client.get(endpoint, params)
-    data = res.get("list", [])
     
     rows = []
-    for k in data:
+    for k in res:
         t = int(k[0]) // 1000
         o, h, l, c, v = float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
-        
-        # ПРОКСИ-РАСЧЕТ TAKER BUY VOLUME (CVD)
-        # Оцениваем, кто доминировал в свече, по тому, где закрылась цена.
+        # OKX не отдает taker buy volume в свечах. Аппроксимируем.
         if h > l:
-            approx_buy_vol = v * (c - l) / (h - l)
+            approx_bv = v * (c - l) / (h - l)
         else:
-            approx_buy_vol = v / 2.0
-            
-        rows.append([t, o, h, l, c, v, approx_buy_vol])
+            approx_bv = v / 2.0
+        rows.append([t, o, h, l, c, v, approx_bv])
         
     df = pd.DataFrame(rows, columns=["t", "o", "h", "l", "c", "v", "bv"])
     return df.set_index("t").sort_index()
@@ -204,33 +214,44 @@ def load_market_data(client, coin, tf, boundary):
     seconds = TIMEFRAMES[tf][0]
     end_ms = boundary * 1000
     start_ms = (boundary - LOOKBACK_BARS * seconds) * 1000
-    sym = f"{coin}USDT"
+    sym_spot = f"{coin}-USDT"
+    sym_swap = f"{coin}-USDT-SWAP"
 
     try:
-        perp = fetch_bybit_klines(client, "linear", sym, tf, start_ms, end_ms)
-        spot = fetch_bybit_klines(client, "spot", sym, tf, start_ms, end_ms)
+        perp = fetch_okx_candles(client, sym_swap, tf, start_ms, end_ms)
+        spot = fetch_okx_candles(client, sym_spot, tf, start_ms, end_ms)
         if spot.empty: raise DataError("Спот пуст")
         
         # Open Interest
-        oi_res = client.get("/v5/market/open-interest", {
-            "category": "linear", "symbol": sym, "intervalTime": TIMEFRAMES[tf][1], "limit": 200
-        })
-        oi_df = pd.DataFrame(oi_res.get("list", []))
+        oi_res = client.get("/public/open-interest", {"instType": "SWAP", "instId": sym_swap})
+        oi_df = pd.DataFrame(oi_res)
         if not oi_df.empty:
-            oi_df["t"] = oi_df["timestamp"].astype(int) // 1000
-            oi_df["oi"] = oi_df["openInterest"].astype(float)
+            oi_df["t"] = oi_df["ts"].astype(int) // 1000
+            oi_df["oi"] = oi_df["oiCcy"].astype(float)
             oi_df = oi_df.set_index("t")[["oi"]].sort_index()
         else:
             raise DataError("Нет данных OI")
 
         # Фандинг
-        fund_res = client.get("/v5/market/funding/history", {"category": "linear", "symbol": sym, "limit": 1})
-        fund_list = fund_res.get("list", [])
+        fund_res = client.get("/public/funding-rate-history", {"instId": sym_swap, "limit": 1})
+        fund_list = fund_res
         funding_val = float(fund_list[0]["fundingRate"]) * 100 if fund_list else 0.0
+
+        # Taker volume (CVD)
+        taker_res = client.get("/rubik/stat/taker-volume", {"ccy": coin, "instType": "SWAP", "period": TIMEFRAMES[tf][1]})
+        taker_df = pd.DataFrame(taker_res)
+        if not taker_df.empty:
+            taker_df["t"] = taker_df["ts"].astype(int) // 1000
+            taker_df["sellVol"] = taker_df["sellVol"].astype(float)
+            taker_df["buyVol"] = taker_df["buyVol"].astype(float)
+            taker_df = taker_df.set_index("t")[["sellVol", "buyVol"]].sort_index()
+        else:
+            taker_df = pd.DataFrame(index=perp.index)
 
         # Собираем
         frame = perp.join(spot.rename(columns={"v": "spot_volume", "bv": "spot_buy_volume"}), how="inner")
         frame = frame.join(oi_df, how="left")
+        frame = frame.join(taker_df, how="left")
         frame["funding"] = funding_val
         frame["long_liq"] = 0.0
         frame["short_liq"] = 0.0
@@ -250,11 +271,9 @@ def load_market_data(client, coin, tf, boundary):
 
 def add_indicators(frame):
     frame = frame.copy()
-    # Дельта спота и перпа
     frame["spot_delta"] = 2 * frame["spot_buy_volume"] - frame["spot_volume"]
     frame["perp_delta"] = 2 * frame["bv"] - frame["v"]
     
-    # Кумулятивная дельта (CVD)
     frame["spot_cvd"] = frame["spot_delta"].cumsum()
     frame["perp_cvd"] = frame["perp_delta"].cumsum()
 
@@ -278,6 +297,7 @@ def rolling_pct(series, window):
     return series.rolling(window, min_periods=min_periods).apply(
         lambda x: float((x <= x[-1]).mean()) if len(x) > 0 else 0.5, raw=True)
 
+
 def get_context(frame):
     current = frame.iloc[-1]
     spot_flow = frame["spot_delta"].iloc[-3:].sum()
@@ -286,6 +306,7 @@ def get_context(frame):
     if current["c"] > current["ema20"] and spot_flow > 0 and perp_flow > 0: return "bullish"
     if current["c"] < current["ema20"] and spot_flow < 0 and perp_flow < 0: return "bearish"
     return "neutral"
+
 
 def detect_divergence(frame, bullish, lookback=40, order=2, min_gap=3, max_gap=15, max_age=12):
     if len(frame) < lookback: return False
@@ -451,16 +472,16 @@ def load_backtest_frame(client, coin, tf, days):
     end_t = (int(time.time()) // seconds) * seconds
     start_t = end_t - days * 86400
     start_ms, end_ms = start_t * 1000, end_t * 1000
-    sym = f"{coin}USDT"
+    sym_swap = f"{coin}-USDT-SWAP"
     
-    perp = fetch_bybit_klines(client, "linear", sym, tf, start_ms, end_ms)
-    spot = fetch_bybit_klines(client, "spot", sym, tf, start_ms, end_ms)
+    perp = fetch_okx_candles(client, sym_swap, tf, start_ms, end_ms)
+    spot = fetch_okx_candles(client, f"{coin}-USDT", tf, start_ms, end_ms)
     
-    oi_res = client.get("/v5/market/open-interest", {"category": "linear", "symbol": sym, "intervalTime": TIMEFRAMES[tf][1], "limit": 200})
-    oi_df = pd.DataFrame(oi_res.get("list", []))
+    oi_res = client.get("/public/open-interest", {"instType": "SWAP", "instId": sym_swap})
+    oi_df = pd.DataFrame(oi_res)
     if not oi_df.empty:
-        oi_df["t"] = oi_df["timestamp"].astype(int) // 1000
-        oi_df["oi"] = oi_df["openInterest"].astype(float)
+        oi_df["t"] = oi_df["ts"].astype(int) // 1000
+        oi_df["oi"] = oi_df["oiCcy"].astype(float)
         oi_df = oi_df.set_index("t")[["oi"]].sort_index()
     
     frame = perp.join(spot.rename(columns={"v": "spot_volume", "bv": "spot_buy_volume"}), how="inner")
@@ -469,6 +490,7 @@ def load_backtest_frame(client, coin, tf, days):
     frame["long_liq"] = 0.0
     frame["short_liq"] = 0.0
     return add_indicators(frame)
+
 
 def simulate_trade(frame, idx, direction, tp_atr, sl_atr, max_bars):
     entry, atr = float(frame.iloc[idx]["c"]), float(frame["atr"].iloc[idx - 1])
@@ -510,10 +532,10 @@ def run_backtest():
     old_min = MIN_SCORE
     MIN_SCORE = BACKTEST_MIN_SCORE
     logger.info("=" * 74)
-    logger.info(f"BYBIT BACKTEST | days={BACKTEST_DAYS} | TFs={BACKTEST_TFS} | MIN_SCORE={BACKTEST_MIN_SCORE}")
+    logger.info(f"OKX BACKTEST | days={BACKTEST_DAYS} | TFs={BACKTEST_TFS} | MIN_SCORE={BACKTEST_MIN_SCORE}")
     logger.info("=" * 74)
 
-    client = BybitClient()
+    client = OkxClient()
     all_trades = []
 
     for coin in WATCHLIST:
@@ -606,7 +628,7 @@ def format_signal(coin, tf, candle, signal, btc_ctx, high_ctx):
     emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
     return NL.join([
         f"{emoji} <b>ORDER FLOW | {tf.upper()} {signal['direction']}</b>", "",
-        f"Монета: <b>#{coin}USDT (Bybit)</b>", f"Цена закрытия: {signal['price']:,.4f}",
+        f"Монета: <b>#{coin}USDT (OKX)</b>", f"Цена закрытия: {signal['price']:,.4f}",
         f"Свеча закрылась: {closed_at}", f"Сетап: {signal['setup']}",
         f"Баллы условий: {signal['score']}/10", "",
         f"📊 Spot delta: {signal['spot_delta_pct']:+.1f}%", f"📊 Perp delta: {signal['perp_delta_pct']:+.1f}%",
@@ -645,10 +667,10 @@ def main():
     threading.Thread(target=start_health_server, daemon=True).start()
     threading.Thread(target=self_ping_worker, daemon=True).start()
 
-    client, state = BybitClient(), StateStore()
+    client, state = OkxClient(), StateStore()
     cache, data_retry, tg_retry, processed = {}, {}, {}, set()
 
-    send_telegram(f"🚀 <b>Bybit Order Flow запущен</b>\n{', '.join(WATCHLIST)}\nРежим: {'DRY RUN' if DRY_RUN else 'LIVE'}")
+    send_telegram(f"🚀 <b>OKX Order Flow запущен</b>\n{', '.join(WATCHLIST)}\nРежим: {'DRY RUN' if DRY_RUN else 'LIVE'}")
     HEALTH["status"] = "running"
 
     while True:
