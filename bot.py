@@ -33,7 +33,6 @@ coins = [
 
 WATCHLIST = list(dict.fromkeys(["BTC"] + coins))
 
-# Таймфреймы OKX: 15m, 1H, 4H
 TIMEFRAMES = {
     "15m": (900, "15m"),
     "1h": (3600, "1H"),
@@ -67,27 +66,17 @@ TELEGRAM_RETRY_SECONDS = 60
 
 STATE_DB = os.getenv("STATE_DB", "bot_state.sqlite3")
 
-# --- Бэктест ---
 RUN_BACKTEST = os.getenv("RUN_BACKTEST", "false").strip().lower() == "true"
 BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "30"))
 BACKTEST_TP_ATR = float(os.getenv("BACKTEST_TP_ATR", "1.5"))
 BACKTEST_SL_ATR = float(os.getenv("BACKTEST_SL_ATR", "1.0"))
 BACKTEST_MAX_BARS = int(os.getenv("BACKTEST_MAX_BARS", "30"))
-BACKTEST_TFS = [
-    t.strip() for t in os.getenv("BACKTEST_TFS", "1h,4h").split(",")
-    if t.strip()
-]
-BACKTEST_MIN_SCORE = int(
-    os.getenv("BACKTEST_MIN_SCORE", os.getenv("MIN_SCORE", "5"))
-)
+BACKTEST_TFS = [t.strip() for t in os.getenv("BACKTEST_TFS", "1h,4h").split(",") if t.strip()]
+BACKTEST_MIN_SCORE = int(os.getenv("BACKTEST_MIN_SCORE", os.getenv("MIN_SCORE", "5")))
 
 NL = chr(10)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("orderflow")
 
 HEALTH = {
@@ -126,7 +115,6 @@ def self_ping_worker():
     url = os.getenv("RENDER_EXTERNAL_URL", "https://fitstbot.onrender.com/")
     if not url.endswith("/"):
         url += "/"
-    
     while True:
         try:
             res = requests.get(url, timeout=10)
@@ -142,6 +130,7 @@ def self_ping_worker():
 
 class DataError(Exception):
     pass
+
 
 class OkxClient:
     def __init__(self):
@@ -162,11 +151,11 @@ class OkxClient:
                 logger.warning("OKX rate limit. Sleeping 10 sec.")
                 time.sleep(10)
                 continue
-                
+
             if response.status_code >= 500:
                 time.sleep(2 ** attempt)
                 continue
-                
+
             if response.status_code != 200:
                 raise DataError(f"HTTP {response.status_code} | {endpoint}")
 
@@ -194,20 +183,45 @@ def fetch_okx_candles(client, inst_id, tf, start_ms, end_ms):
         "limit": 100
     }
     res = client.get(endpoint, params)
-    
+
     rows = []
     for k in res:
         t = int(k[0]) // 1000
         o, h, l, c, v = float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
-        # OKX не отдает taker buy volume в свечах. Аппроксимируем.
         if h > l:
             approx_bv = v * (c - l) / (h - l)
         else:
             approx_bv = v / 2.0
         rows.append([t, o, h, l, c, v, approx_bv])
-        
+
     df = pd.DataFrame(rows, columns=["t", "o", "h", "l", "c", "v", "bv"])
     return df.set_index("t").sort_index()
+
+
+def _safe_oi_df(oi_res, index):
+    """Безопасно парсит ответ Open Interest."""
+    if not oi_res:
+        return pd.DataFrame(index=index, columns=["oi"], data=1.0)
+    df = pd.DataFrame(oi_res)
+    if "ts" not in df.columns or "oiCcy" not in df.columns:
+        return pd.DataFrame(index=index, columns=["oi"], data=1.0)
+    df["t"] = df["ts"].astype(int) // 1000
+    df["oi"] = df["oiCcy"].astype(float)
+    return df.set_index("t")[["oi"]].sort_index()
+
+
+def _safe_taker_df(taker_res, index):
+    """Безопасно парсит ответ Taker Volume."""
+    if not taker_res:
+        return pd.DataFrame(index=index)
+    df = pd.DataFrame(taker_res)
+    # Проверяем наличие всех нужных колонок
+    if not {"ts", "sellVol", "buyVol"}.issubset(df.columns):
+        return pd.DataFrame(index=index)
+    df["t"] = df["ts"].astype(int) // 1000
+    df["sellVol"] = df["sellVol"].astype(float)
+    df["buyVol"] = df["buyVol"].astype(float)
+    return df.set_index("t")[["sellVol", "buyVol"]].sort_index()
 
 
 def load_market_data(client, coin, tf, boundary):
@@ -220,38 +234,25 @@ def load_market_data(client, coin, tf, boundary):
     try:
         perp = fetch_okx_candles(client, sym_swap, tf, start_ms, end_ms)
         spot = fetch_okx_candles(client, sym_spot, tf, start_ms, end_ms)
-        if spot.empty: raise DataError("Спот пуст")
-        
+        if spot.empty:
+            raise DataError("Спот пуст")
+
         # Open Interest
         oi_res = client.get("/public/open-interest", {"instType": "SWAP", "instId": sym_swap})
-        oi_df = pd.DataFrame(oi_res)
-        if not oi_df.empty:
-            oi_df["t"] = oi_df["ts"].astype(int) // 1000
-            oi_df["oi"] = oi_df["oiCcy"].astype(float)
-            oi_df = oi_df.set_index("t")[["oi"]].sort_index()
-        else:
-            raise DataError("Нет данных OI")
+        oi_df = _safe_oi_df(oi_res, perp.index)
 
         # Фандинг
         fund_res = client.get("/public/funding-rate-history", {"instId": sym_swap, "limit": 1})
-        fund_list = fund_res
-        funding_val = float(fund_list[0]["fundingRate"]) * 100 if fund_list else 0.0
+        funding_val = float(fund_res[0]["fundingRate"]) * 100 if fund_res else 0.0
 
-        # Taker volume (CVD) - ИСПРАВЛЕНО
+        # Taker volume (CVD)
         taker_period = "5m" if tf == "15m" else "1H"
         taker_res = client.get("/rubik/stat/taker-volume", {
             "ccy": coin,
             "instType": "CONTRACTS",
             "period": taker_period
         })
-        taker_df = pd.DataFrame(taker_res)
-        if not taker_df.empty:
-            taker_df["t"] = taker_df["ts"].astype(int) // 1000
-            taker_df["sellVol"] = taker_df["sellVol"].astype(float)
-            taker_df["buyVol"] = taker_df["buyVol"].astype(float)
-            taker_df = taker_df.set_index("t")[["sellVol", "buyVol"]].sort_index()
-        else:
-            taker_df = pd.DataFrame(index=perp.index)
+        taker_df = _safe_taker_df(taker_res, perp.index)
 
         # Собираем
         frame = perp.join(spot.rename(columns={"v": "spot_volume", "bv": "spot_buy_volume"}), how="inner")
@@ -262,10 +263,12 @@ def load_market_data(client, coin, tf, boundary):
         frame["short_liq"] = 0.0
 
         frame = frame.ffill().bfill().dropna()
-        if len(frame) < REQUIRED_BARS: raise DataError(f"Мало баров: {len(frame)}")
+        if len(frame) < REQUIRED_BARS:
+            raise DataError(f"Мало баров: {len(frame)}")
         frame = frame.loc[frame.index + seconds <= boundary]
-        
+
         return add_indicators(frame)
+
     except Exception as e:
         raise DataError(str(e))
 
@@ -278,7 +281,7 @@ def add_indicators(frame):
     frame = frame.copy()
     frame["spot_delta"] = 2 * frame["spot_buy_volume"] - frame["spot_volume"]
     frame["perp_delta"] = 2 * frame["bv"] - frame["v"]
-    
+
     frame["spot_cvd"] = frame["spot_delta"].cumsum()
     frame["perp_cvd"] = frame["perp_delta"].cumsum()
 
@@ -308,13 +311,16 @@ def get_context(frame):
     spot_flow = frame["spot_delta"].iloc[-3:].sum()
     perp_flow = frame["perp_delta"].iloc[-3:].sum()
 
-    if current["c"] > current["ema20"] and spot_flow > 0 and perp_flow > 0: return "bullish"
-    if current["c"] < current["ema20"] and spot_flow < 0 and perp_flow < 0: return "bearish"
+    if current["c"] > current["ema20"] and spot_flow > 0 and perp_flow > 0:
+        return "bullish"
+    if current["c"] < current["ema20"] and spot_flow < 0 and perp_flow < 0:
+        return "bearish"
     return "neutral"
 
 
 def detect_divergence(frame, bullish, lookback=40, order=2, min_gap=3, max_gap=15, max_age=12):
-    if len(frame) < lookback: return False
+    if len(frame) < lookback:
+        return False
     window = frame.iloc[-lookback:]
     prices = (window["l"] if bullish else window["h"]).to_numpy()
     cvd = window["spot_cvd"].to_numpy()
@@ -324,23 +330,31 @@ def detect_divergence(frame, bullish, lookback=40, order=2, min_gap=3, max_gap=1
     for i in range(order, n - order):
         left, right = prices[i - order:i], prices[i + 1:i + 1 + order]
         if bullish:
-            if prices[i] < left.min() and prices[i] < right.min(): pivots.append(i)
+            if prices[i] < left.min() and prices[i] < right.min():
+                pivots.append(i)
         else:
-            if prices[i] > left.max() and prices[i] > right.max(): pivots.append(i)
+            if prices[i] > left.max() and prices[i] > right.max():
+                pivots.append(i)
 
-    if len(pivots) < 2: return False
+    if len(pivots) < 2:
+        return False
     for k in range(len(pivots) - 1, 0, -1):
         i2 = pivots[k]
-        if n - 1 - i2 > max_age: continue
+        if n - 1 - i2 > max_age:
+            continue
         for j in range(k - 1, -1, -1):
             i1 = pivots[j]
             gap = i2 - i1
-            if gap < min_gap: continue
-            if gap > max_gap: break
+            if gap < min_gap:
+                continue
+            if gap > max_gap:
+                break
             if bullish:
-                if prices[i2] < prices[i1] and cvd[i2] > cvd[i1]: return True
+                if prices[i2] < prices[i1] and cvd[i2] > cvd[i1]:
+                    return True
             else:
-                if prices[i2] > prices[i1] and cvd[i2] < cvd[i1]: return True
+                if prices[i2] > prices[i1] and cvd[i2] < cvd[i1]:
+                    return True
     return False
 
 
@@ -348,10 +362,13 @@ def analyze_orderflow(frame):
     current, previous = frame.iloc[-1], frame.iloc[-2]
     atr = float(frame["atr"].iloc[-2])
 
-    if not np.isfinite(atr) or atr <= 0: return [], "Некорректный ATR"
+    if not np.isfinite(atr) or atr <= 0:
+        return [], "Некорректный ATR"
     candle_range = current["h"] - current["l"]
-    if candle_range < atr * 0.35: return [], "Слишком маленькая свеча"
-    if candle_range > atr * 3: return [], "Слишком растянутая свеча"
+    if candle_range < atr * 0.35:
+        return [], "Слишком маленькая свеча"
+    if candle_range > atr * 3:
+        return [], "Слишком растянутая свеча"
 
     average_volume = frame["v"].iloc[-21:-1].mean()
     if average_volume <= 0 or current["v"] <= 0 or current["spot_volume"] <= 0:
@@ -478,17 +495,13 @@ def load_backtest_frame(client, coin, tf, days):
     start_t = end_t - days * 86400
     start_ms, end_ms = start_t * 1000, end_t * 1000
     sym_swap = f"{coin}-USDT-SWAP"
-    
+
     perp = fetch_okx_candles(client, sym_swap, tf, start_ms, end_ms)
     spot = fetch_okx_candles(client, f"{coin}-USDT", tf, start_ms, end_ms)
-    
+
     oi_res = client.get("/public/open-interest", {"instType": "SWAP", "instId": sym_swap})
-    oi_df = pd.DataFrame(oi_res)
-    if not oi_df.empty:
-        oi_df["t"] = oi_df["ts"].astype(int) // 1000
-        oi_df["oi"] = oi_df["oiCcy"].astype(float)
-        oi_df = oi_df.set_index("t")[["oi"]].sort_index()
-    
+    oi_df = _safe_oi_df(oi_res, perp.index)
+
     frame = perp.join(spot.rename(columns={"v": "spot_volume", "bv": "spot_buy_volume"}), how="inner")
     frame = frame.join(oi_df, how="left").ffill().bfill()
     frame["funding"] = 0.0
@@ -499,26 +512,33 @@ def load_backtest_frame(client, coin, tf, days):
 
 def simulate_trade(frame, idx, direction, tp_atr, sl_atr, max_bars):
     entry, atr = float(frame.iloc[idx]["c"]), float(frame["atr"].iloc[idx - 1])
-    if not np.isfinite(atr) or atr <= 0: return "invalid", 0.0, 0
+    if not np.isfinite(atr) or atr <= 0:
+        return "invalid", 0.0, 0
 
     tp, sl = (entry + tp_atr * atr, entry - sl_atr * atr) if direction == "LONG" else (entry - tp_atr * atr, entry + sl_atr * atr)
     end = min(idx + 1 + max_bars, len(frame))
     for j in range(idx + 1, end):
         bar = frame.iloc[j]
         if direction == "LONG":
-            if bar["l"] <= sl: return "SL", -1.0, j - idx
-            if bar["h"] >= tp: return "TP", tp_atr / sl_atr, j - idx
+            if bar["l"] <= sl:
+                return "SL", -1.0, j - idx
+            if bar["h"] >= tp:
+                return "TP", tp_atr / sl_atr, j - idx
         else:
-            if bar["h"] >= sl: return "SL", -1.0, j - idx
-            if bar["l"] <= tp: return "TP", tp_atr / sl_atr, j - idx
+            if bar["h"] >= sl:
+                return "SL", -1.0, j - idx
+            if bar["l"] <= tp:
+                return "TP", tp_atr / sl_atr, j - idx
 
     last_j = min(idx + max_bars, len(frame) - 1)
     exit_px = float(frame.iloc[last_j]["c"])
     pnl_r = (exit_px - entry) / (sl_atr * atr) if direction == "LONG" else (entry - exit_px) / (sl_atr * atr)
     return "TIMEOUT", pnl_r, last_j - idx
 
+
 def _summary(subset):
-    if not subset: return None
+    if not subset:
+        return None
     pnls = np.array([t["pnl_r"] for t in subset], dtype=float)
     wins = pnls > 0
     equity = np.cumsum(pnls)
@@ -528,9 +548,12 @@ def _summary(subset):
     pf = float(gains / abs(losses)) if losses < 0 else float("inf")
     return {"n": int(len(pnls)), "wr": float(wins.mean() * 100), "avg_r": float(pnls.mean()), "total_r": float(pnls.sum()), "pf": pf, "max_dd": dd}
 
+
 def _fmt(label, s):
-    if s is None: return f"  {label}: НЕТ СДЕЛОК"
+    if s is None:
+        return f"  {label}: НЕТ СДЕЛОК"
     return f"  {label}: N={s['n']} WR={s['wr']:.1f}% AvgR={s['avg_r']:+.3f} TotalR={s['total_r']:+.2f} PF={s['pf']:.2f} MaxDD={s['max_dd']:+.2f}R"
+
 
 def run_backtest():
     global MIN_SCORE
@@ -545,7 +568,8 @@ def run_backtest():
 
     for coin in WATCHLIST:
         for tf in BACKTEST_TFS:
-            if tf not in TIMEFRAMES: continue
+            if tf not in TIMEFRAMES:
+                continue
             logger.info(f"--- {coin} {tf} ---")
             try:
                 frame = load_backtest_frame(client, coin, tf, BACKTEST_DAYS)
@@ -560,14 +584,17 @@ def run_backtest():
                     candidates, _ = analyze_orderflow(window)
                 except Exception:
                     continue
-                if not candidates or len(candidates) > 1: continue
+                if not candidates or len(candidates) > 1:
+                    continue
 
                 sig = candidates[0]
                 candle_ts = int(frame.index[i])
-                if (sig["direction"],) in last_signal and (candle_ts - last_signal[(sig["direction"],)] < COOLDOWN_BARS * TIMEFRAMES[tf][0]): continue
+                if (sig["direction"],) in last_signal and (candle_ts - last_signal[(sig["direction"],)] < COOLDOWN_BARS * TIMEFRAMES[tf][0]):
+                    continue
 
                 outcome, pnl_r, bars = simulate_trade(frame, i, sig["direction"], BACKTEST_TP_ATR, BACKTEST_SL_ATR, BACKTEST_MAX_BARS)
-                if outcome == "invalid": continue
+                if outcome == "invalid":
+                    continue
 
                 last_signal[(sig["direction"],)] = candle_ts
                 signals += 1
@@ -575,11 +602,13 @@ def run_backtest():
             logger.info(f"  Сигналов: {signals}")
 
     MIN_SCORE = old_min
-    if not all_trades: return logger.info("=== НЕТ СДЕЛОК ===")
+    if not all_trades:
+        return logger.info("=== НЕТ СДЕЛОК ===")
     logger.info("=" * 74)
     logger.info("BACKTEST SUMMARY")
     logger.info(_fmt("ALL", _summary(all_trades)))
-    for coin in WATCHLIST: logger.info(_fmt(coin, _summary([t for t in all_trades if t["coin"] == coin])))
+    for coin in WATCHLIST:
+        logger.info(_fmt(coin, _summary([t for t in all_trades if t["coin"] == coin])))
     logger.info("=" * 74)
 
 
@@ -600,7 +629,8 @@ class StateStore:
         now = int(time.time())
         self.db.execute("INSERT INTO of_audit VALUES (?, ?, ?, ?, ?)", (now, coin, tf, int(candle), serialized))
         if now - self.last_cleanup > 3600:
-            self.db.execute("DELETE FROM of_audit WHERE created < ?", (now - 30 * 86400,)); self.last_cleanup = now
+            self.db.execute("DELETE FROM of_audit WHERE created < ?", (now - 30 * 86400,))
+            self.last_cleanup = now
         self.db.commit()
         logger.info("%s %s candle=%s | %s", coin, tf, candle, serialized)
 
@@ -620,13 +650,16 @@ class StateStore:
         self.db.execute("INSERT OR IGNORE INTO of_signals VALUES (?, ?, ?, ?, ?, ?)", (self.signal_id(coin, tf, direction, candle), coin, tf, direction, int(candle), mode))
         self.db.commit()
 
+
 def send_telegram(text):
-    if DRY_RUN: return logger.info("DRY_RUN: %s", text)
+    if DRY_RUN:
+        return logger.info("DRY_RUN: %s", text)
     try:
         res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=20)
         return res.status_code == 200
     except Exception:
         return False
+
 
 def format_signal(coin, tf, candle, signal, btc_ctx, high_ctx):
     closed_at = datetime.fromtimestamp(candle + TIMEFRAMES[tf][0], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -641,9 +674,11 @@ def format_signal(coin, tf, candle, signal, btc_ctx, high_ctx):
         f"• Spot подтверждает", f"• {signal['reasons'][1]}"
     ])
 
+
 def get_boundaries():
     eff = int(time.time()) - CLOSE_DELAY
     return {tf: (eff // s[0]) * s[0] for tf, s in TIMEFRAMES.items()}
+
 
 def check_contexts(coin, tf, direction, cache, boundaries):
     opposite = "bearish" if direction == "LONG" else "bullish"
@@ -651,16 +686,20 @@ def check_contexts(coin, tf, direction, cache, boundaries):
     btc_ctx = "neutral"
     if coin != "BTC":
         rec = cache.get(("BTC", btc_tf))
-        if not rec or rec["boundary"] != boundaries[btc_tf]: return "BTC-контекст отсутствует", None, None, True
+        if not rec or rec["boundary"] != boundaries[btc_tf]:
+            return "BTC-контекст отсутствует", None, None, True
         btc_ctx = rec["context"]
     higher_tf = HIGHER_TIMEFRAME.get(tf)
     high_ctx = "not_used"
     if higher_tf:
         rec = cache.get((coin, higher_tf))
-        if not rec or rec["boundary"] != boundaries[higher_tf]: return "Старший ТФ отсутствует", btc_ctx, None, True
+        if not rec or rec["boundary"] != boundaries[higher_tf]:
+            return "Старший ТФ отсутствует", btc_ctx, None, True
         high_ctx = rec["context"]
-        if high_ctx == opposite and btc_ctx == opposite: return "BTC и старший ТФ против", btc_ctx, high_ctx, False
+        if high_ctx == opposite and btc_ctx == opposite:
+            return "BTC и старший ТФ против", btc_ctx, high_ctx, False
     return None, btc_ctx, high_ctx, False
+
 
 def main():
     if RUN_BACKTEST:
@@ -685,8 +724,10 @@ def main():
         for tf in LOAD_ORDER:
             for coin in WATCHLIST:
                 key = (coin, tf)
-                if cache.get(key) and cache[key]["boundary"] == boundaries[tf]: continue
-                if time.time() < data_retry.get(key, 0): continue
+                if cache.get(key) and cache[key]["boundary"] == boundaries[tf]:
+                    continue
+                if time.time() < data_retry.get(key, 0):
+                    continue
 
                 try:
                     frame = load_market_data(client, coin, tf, boundaries[tf])
@@ -703,28 +744,36 @@ def main():
         for tf in LOAD_ORDER:
             for coin in WATCHLIST:
                 rec = cache.get((coin, tf))
-                if not rec or rec["boundary"] != boundaries[tf]: continue
+                if not rec or rec["boundary"] != boundaries[tf]:
+                    continue
                 frame = rec["frame"]
                 candle = int(frame.index[-1])
                 work_key = (coin, tf, candle)
-                if work_key in processed: continue
+                if work_key in processed:
+                    continue
 
                 candidates, explanation = analyze_orderflow(frame)
                 if not candidates:
-                    state.record(coin, tf, candle, {"skip": explanation}); processed.add(work_key); continue
+                    state.record(coin, tf, candle, {"skip": explanation})
+                    processed.add(work_key)
+                    continue
                 if len(candidates) > 1:
-                    state.record(coin, tf, candle, {"skip": "Противоречивые"}); processed.add(work_key); continue
+                    state.record(coin, tf, candle, {"skip": "Противоречивые"})
+                    processed.add(work_key)
+                    continue
 
                 signal = candidates[0]
                 block_reason, btc_ctx, high_ctx, waiting = check_contexts(coin, tf, signal["direction"], cache, boundaries)
 
                 if block_reason:
                     state.record(coin, tf, candle, {"skip": block_reason})
-                    if not waiting: processed.add(work_key)
+                    if not waiting:
+                        processed.add(work_key)
                     continue
 
                 if state.already_sent(coin, tf, signal["direction"], candle) or state.cooldown_active(coin, tf, signal["direction"], candle):
-                    processed.add(work_key); continue
+                    processed.add(work_key)
+                    continue
 
                 message = format_signal(coin, tf, candle, signal, btc_ctx, high_ctx)
                 if send_telegram(message):
@@ -735,8 +784,10 @@ def main():
         cutoff = int(time.time()) - 3 * 86400
         processed = {k for k in processed if k[2] >= cutoff}
         HEALTH["last_cycle"] = int(time.time())
-        if not cycle_has_errors: HEALTH["last_error"] = None
+        if not cycle_has_errors:
+            HEALTH["last_error"] = None
         time.sleep(30)
+
 
 if __name__ == "__main__":
     try:
