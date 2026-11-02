@@ -131,6 +131,23 @@ def start_health_server():
     server.serve_forever()
 
 
+def self_ping_worker():
+    """Пингует свой же URL каждые 10 минут, чтобы Render не усыплял сервис."""
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        logger.warning("RENDER_EXTERNAL_URL не задан, пингер отключен.")
+        return
+
+    ping_url = f"{url}/"
+    while True:
+        try:
+            res = requests.get(ping_url, timeout=10)
+            logger.info("Self-ping OK | HTTP %s", res.status_code)
+        except Exception as exc:
+            logger.warning("Self-ping failed: %s", type(exc).__name__)
+        time.sleep(600)  # Ждем 10 минут (600 секунд)
+
+
 # ============================================================
 # COINALYZE
 # ============================================================
@@ -1293,7 +1310,6 @@ def run_backtest():
             last_signal = {}
             signals = 0
 
-            # ИСПРАВЛЕНИЕ OOM: Берем только последние 200 баров для анализа
             for i in range(REQUIRED_BARS, len(frame) - 1):
                 if i % 100 == 0:
                     logger.info(f"  ... обработано {i} / {len(frame)} баров")
@@ -1401,6 +1417,7 @@ def main():
 
     if RUN_BACKTEST:
         threading.Thread(target=start_health_server, daemon=True).start()
+        threading.Thread(target=self_ping_worker, daemon=True).start()
         HEALTH["status"] = "backtest"
         try:
             run_backtest()
@@ -1423,6 +1440,7 @@ def main():
         raise RuntimeError("MIN_SCORE должен быть от 1 до 10")
 
     threading.Thread(target=start_health_server, daemon=True).start()
+    threading.Thread(target=self_ping_worker, daemon=True).start()
 
     client = CoinalyzeClient()
     state = StateStore()
