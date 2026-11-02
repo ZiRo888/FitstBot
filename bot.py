@@ -205,7 +205,6 @@ class CoinalyzeClient:
                 except ValueError:
                     delay = 60
 
-                # ДОБАВЛЕН ЛОГ ДЛЯ ДИАГНОСТИКИ 429 ОШИБКИ
                 logger.warning("Coinalyze 429 | Лимит API | Сплю %.1f секунд", delay)
                 time.sleep(max(1, delay))
                 continue
@@ -1115,7 +1114,6 @@ def _fetch_raw(client, endpoint, symbol, tf, start_t, end_t, columns, usd=False)
     if usd:
         params["convert_to_usd"] = "true"
 
-    # ДОБАВЛЕН ЛОГ ДЛЯ ОТСЛЕЖИВАНИЯ ТЕКУЩЕГО ЗАПРОСА
     logger.info("  Запрос %s для %s...", endpoint, symbol)
 
     result = client.get(endpoint, params)
@@ -1180,7 +1178,6 @@ def load_backtest_frame(client, market, tf, days):
 
 def simulate_trade(frame, idx, direction, tp_atr, sl_atr, max_bars):
     entry = float(frame.iloc[idx]["c"])
-    # analyze_orderflow смотрит ATR на .iloc[-2], т.е. на предыдущем баре
     atr = float(frame["atr"].iloc[idx - 1])
     if not np.isfinite(atr) or atr <= 0:
         return "invalid", 0.0, 0
@@ -1296,12 +1293,19 @@ def run_backtest():
             last_signal = {}
             signals = 0
 
+            # ИСПРАВЛЕНИЕ OOM: Берем только последние 200 баров для анализа
             for i in range(REQUIRED_BARS, len(frame) - 1):
-                window = frame.iloc[:i + 1]
+                if i % 100 == 0:
+                    logger.info(f"  ... обработано {i} / {len(frame)} баров")
+
+                start_idx = max(0, i - 200)
+                window = frame.iloc[start_idx:i + 1]
+                
                 try:
                     candidates, _ = analyze_orderflow(window)
                 except Exception:
                     continue
+                    
                 if not candidates or len(candidates) > 1:
                     continue
 
@@ -1395,8 +1399,6 @@ def main():
             "Задайте COINALYZE_API_KEY в Render Environment"
         )
 
-    # Режим бэктеста: запускаем health-сервер (чтобы Render не убил контейнер)
-    # и прогоняем бэктест, не входя в live-цикл.
     if RUN_BACKTEST:
         threading.Thread(target=start_health_server, daemon=True).start()
         HEALTH["status"] = "backtest"
