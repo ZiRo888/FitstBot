@@ -237,8 +237,13 @@ def load_market_data(client, coin, tf, boundary):
         fund_list = fund_res
         funding_val = float(fund_list[0]["fundingRate"]) * 100 if fund_list else 0.0
 
-        # Taker volume (CVD)
-        taker_res = client.get("/rubik/stat/taker-volume", {"ccy": coin, "instType": "SWAP", "period": TIMEFRAMES[tf][1]})
+        # Taker volume (CVD) - ИСПРАВЛЕНО
+        taker_period = "5m" if tf == "15m" else "1H"
+        taker_res = client.get("/rubik/stat/taker-volume", {
+            "ccy": coin,
+            "instType": "CONTRACTS",
+            "period": taker_period
+        })
         taker_df = pd.DataFrame(taker_res)
         if not taker_df.empty:
             taker_df["t"] = taker_df["ts"].astype(int) // 1000
