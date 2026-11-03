@@ -44,7 +44,12 @@ LOOKBACK_BARS = 100
 REQUIRED_BARS = 65
 
 CLOSE_DELAY = int(os.getenv("CLOSE_DELAY_SECONDS", "45"))
-MAX_SIGNAL_DELAY = int(os.getenv("MAX_SIGNAL_DELAY_SECONDS", "600"))
+# Максимальный возраст сигнала при отправке: отдельно для каждого таймфрейма.
+# Значение можно переопределить через Render Environment.
+MAX_SIGNAL_DELAY_BY_TF = {
+    "1h": int(os.getenv("MAX_SIGNAL_DELAY_1H_SECONDS", "3600")),
+    "4h": int(os.getenv("MAX_SIGNAL_DELAY_4H_SECONDS", "14400")),
+}
 MIN_SCORE = int(os.getenv("MIN_SCORE", "10"))
 COOLDOWN_BARS = int(os.getenv("COOLDOWN_BARS", "2"))
 
@@ -193,24 +198,80 @@ def build_market_map(client):
     spots = client.get("spot-markets")
     futures = client.get("future-markets")
     mapping = {}
+
+    # Проверяем глубину Spot-истории отдельно для каждого TF. Это позволяет,
+    # например, оставить XRP на 4H, даже если для 1H нет достаточной истории.
+    now = int(time.time())
+    probe_boundaries = {
+        tf: ((now - CLOSE_DELAY) // spec[0]) * spec[0]
+        for tf, spec in TIMEFRAMES.items()
+    }
+
     for coin in WATCHLIST:
         perps = [m for m in futures if _is_required_exchange(m.get("exchange")) and m.get("base_asset") == coin and m.get("quote_asset") == "USDT" and bool(m.get("is_perpetual")) and bool(m.get("has_ohlcv_data"))]
-        # Сбрасываем Spot для каждой монеты, чтобы не переиспользовать рынок предыдущей.
-        spot = None
-        for ex_code in SPOT_FALLBACK_EXCHANGES:
-            candidates = [m for m in spots if str(m.get("exchange", "")).strip() == ex_code and m.get("base_asset") == coin and m.get("quote_asset") == "USDT" and "USDT" in str(m.get("symbol", "")).upper()]
-            if candidates:
-                spot = sorted(candidates, key=lambda m: m["symbol"])[0]
-                break
-        if not perps or spot is None:
-            logger.warning(
-                "MARKET SKIP | %s | Perp=%s Spot=%s | монета исключена, остальные продолжат работу",
-                coin, bool(perps), bool(spot)
-            )
+        if not perps:
+            logger.warning("MARKET SKIP | %s | Perp=False | монета исключена", coin)
             continue
+
         perps.sort(key=lambda m: (not bool(m.get("has_long_short_ratio_data")), m["symbol"]))
-        mapping[coin] = {"spot": spot, "perp": perps[0]}
-        logger.info("MARKET OK | %s | spot=%s (%s) | perp=%s", coin, spot["symbol"], exchange_name(spot.get("exchange")), perps[0]["symbol"])
+        spot_by_tf = {}
+        for tf in TIMEFRAMES:
+            selected = None
+            best_count = -1
+            candidates_for_coin = []
+            for ex_code in SPOT_FALLBACK_EXCHANGES:
+                exchange_candidates = [
+                    m for m in spots
+                    if str(m.get("exchange", "")).strip() == ex_code
+                    and m.get("base_asset") == coin
+                    and m.get("quote_asset") == "USDT"
+                    and "USDT" in str(m.get("symbol", "")).upper()
+                ]
+                candidates_for_coin.extend(sorted(exchange_candidates, key=lambda m: m["symbol"]))
+
+            for candidate in candidates_for_coin:
+                symbol = candidate["symbol"]
+                try:
+                    probe = client.history(
+                        "ohlcv-history", symbol, tf, probe_boundaries[tf], ["v", "bv"]
+                    )
+                    bars = len(probe)
+                    best_count = max(best_count, bars)
+                    if bars >= REQUIRED_BARS:
+                        selected = candidate
+                        logger.info(
+                            "SPOT SELECT | %s %s | %s (%s) | bars=%d",
+                            coin, tf, symbol, exchange_name(candidate.get("exchange")), bars
+                        )
+                        break
+                    logger.warning(
+                        "SPOT REJECT | %s %s | %s (%s) | bars=%d < %d",
+                        coin, tf, symbol, exchange_name(candidate.get("exchange")), bars, REQUIRED_BARS
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "SPOT PROBE ERR | %s %s | %s (%s) | %s",
+                        coin, tf, symbol, exchange_name(candidate.get("exchange")), exc
+                    )
+
+            spot_by_tf[tf] = selected
+            if selected is None:
+                logger.warning(
+                    "SPOT UNAVAILABLE | %s %s | нет Spot-рынка с историей >= %d баров (лучшая выборка=%d)",
+                    coin, tf, REQUIRED_BARS, best_count
+                )
+
+        if not any(spot_by_tf.values()):
+            logger.warning("MARKET SKIP | %s | нет Spot-истории достаточной длины ни на одном TF", coin)
+            continue
+
+        mapping[coin] = {"spot_by_tf": spot_by_tf, "perp": perps[0]}
+        selected_text = ", ".join(
+            f"{tf}={market['symbol'] if market else 'нет'}"
+            for tf, market in spot_by_tf.items()
+        )
+        logger.info("MARKET OK | %s | spot[%s] | perp=%s", coin, selected_text, perps[0]["symbol"])
+
     if not mapping:
         raise DataError("Не удалось найти ни одной монеты с подходящими Spot и perpetual рынками")
     skipped = [coin for coin in WATCHLIST if coin not in mapping]
@@ -389,7 +450,10 @@ class StateStore:
         self.db.commit()
 
 def load_market_data(client, market, tf, boundary, coin="?"):
-    perp_sym, spot_sym = market["perp"]["symbol"], market["spot"]["symbol"]
+    spot_market = market.get("spot_by_tf", {}).get(tf)
+    if spot_market is None:
+        raise DataError(f"для {coin} {tf} нет Spot-рынка с историей >= {REQUIRED_BARS} баров")
+    perp_sym, spot_sym = market["perp"]["symbol"], spot_market["symbol"]
 
     # Получаем источники отдельно и сразу записываем размер каждой выборки.
     perp = client.history("ohlcv-history", perp_sym, tf, boundary, ["o", "h", "l", "c", "v", "bv"])
@@ -434,14 +498,20 @@ def send_telegram(text):
         return res.status_code == 200
     except Exception: return False
 
-def format_signal(coin, tf, candle, signal, market):
-    closed_at = datetime.fromtimestamp(candle + TIMEFRAMES[tf][0], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def format_signal(coin, tf, candle, signal, detected_at):
+    signal_time = candle + TIMEFRAMES[tf][0]
+    age_seconds = max(0, int(detected_at) - signal_time)
+    signal_time_text = datetime.fromtimestamp(signal_time, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    detected_text = datetime.fromtimestamp(detected_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    age_minutes = age_seconds // 60
     emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
     return NL.join([
         f"{emoji} <b>ORDER FLOW | {tf.upper()} {signal['direction']}</b>", "",
-        f"Монета: <b>#{coin}USDT</b>", f"Цена: {signal['price']:,.4f}",
-        f"Время: {closed_at}", f"Сетап: {signal['setup']}",
-        f"Баллы: {signal['score']}/10", "",
+        f"Монета: <b>#{coin}USDT</b>", f"Цена сигнала: <b>{signal['price']:,.4f}</b>",
+        f"Время сигнала (закрытие свечи): {signal_time_text}",
+        f"Бот обнаружил/отправляет: {detected_text}",
+        f"Возраст сигнала: {age_minutes} мин.",
+        f"Сетап: {signal['setup']}", f"Баллы: {signal['score']}/10", "",
         f"📊 Spot: {signal['spot_delta_pct']:+.1f}%", f"📊 Perp: {signal['perp_delta_pct']:+.1f}%",
         f"🏦 OI: {signal['oi_change']:+.2f}%", f"💰 Funding: {signal['funding']:+.4f}%"
     ])
@@ -457,8 +527,9 @@ def main():
 
     # В текущей загрузке L/S Ratio не запрашивается, поэтому фактически доступны 8 баллов.
     logger.info(
-        "CONFIG | REQUESTED_WATCHLIST=%s | TIMEFRAMES=%s | MIN_SCORE=%d | REQUIRED_BARS=%d | MAX_SIGNAL_DELAY=%d sec | DRY_RUN=%s",
-        ",".join(WATCHLIST), ",".join(LOAD_ORDER), MIN_SCORE, REQUIRED_BARS, MAX_SIGNAL_DELAY, DRY_RUN
+        "CONFIG | REQUESTED_WATCHLIST=%s | TIMEFRAMES=%s | MIN_SCORE=%d | REQUIRED_BARS=%d | MAX_SIGNAL_DELAY_1H=%d sec | MAX_SIGNAL_DELAY_4H=%d sec | DRY_RUN=%s",
+        ",".join(WATCHLIST), ",".join(LOAD_ORDER), MIN_SCORE, REQUIRED_BARS,
+        MAX_SIGNAL_DELAY_BY_TF["1h"], MAX_SIGNAL_DELAY_BY_TF["4h"], DRY_RUN
     )
     if MIN_SCORE > 8:
         logger.warning(
@@ -486,6 +557,8 @@ def main():
 
         for tf in LOAD_ORDER:
             for coin in active_watchlist:
+                if market_map[coin].get("spot_by_tf", {}).get(tf) is None:
+                    continue
                 key = (coin, tf)
                 boundary = boundaries[tf]
                 if cache.get(key) and cache[key]["boundary"] == boundary:
@@ -515,6 +588,8 @@ def main():
 
         for tf in LOAD_ORDER:
             for coin in active_watchlist:
+                if market_map[coin].get("spot_by_tf", {}).get(tf) is None:
+                    continue
                 rec = cache.get((coin, tf))
                 if not rec or rec["boundary"] != boundaries[tf]:
                     continue
@@ -528,11 +603,12 @@ def main():
                 # candle — время открытия свечи; прибавляем длительность TF, чтобы получить
                 # фактическое время её закрытия.
                 candle_close_time = candle + TIMEFRAMES[tf][0]
+                max_signal_age = MAX_SIGNAL_DELAY_BY_TF[tf]
                 signal_age = int(time.time()) - candle_close_time
-                if signal_age < 0 or signal_age > MAX_SIGNAL_DELAY:
+                if signal_age < 0 or signal_age > max_signal_age:
                     logger.info(
                         "SIGNAL SKIP STALE | %s %s | age=%d sec | max=%d sec | candle_close=%s",
-                        coin, tf, signal_age, MAX_SIGNAL_DELAY,
+                        coin, tf, signal_age, max_signal_age,
                         datetime.fromtimestamp(candle_close_time, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                     )
                     processed.add(work_key)
@@ -550,17 +626,18 @@ def main():
                     continue
 
                 # Повторная проверка непосредственно перед отправкой: анализ/очередь
-                # могли занять время, и сигнал мог выйти за допустимые 10 минут.
-                signal_age = int(time.time()) - candle_close_time
-                if signal_age < 0 or signal_age > MAX_SIGNAL_DELAY:
+                # могли занять время, и сигнал мог выйти за возрастной лимит TF.
+                detected_at = int(time.time())
+                signal_age = detected_at - candle_close_time
+                if signal_age < 0 or signal_age > max_signal_age:
                     logger.info(
                         "SIGNAL SKIP STALE BEFORE SEND | %s %s | age=%d sec | max=%d sec",
-                        coin, tf, signal_age, MAX_SIGNAL_DELAY
+                        coin, tf, signal_age, max_signal_age
                     )
                     processed.add(work_key)
                     continue
 
-                message = format_signal(coin, tf, candle, signal, market_map[coin])
+                message = format_signal(coin, tf, candle, signal, detected_at)
                 if send_telegram(message):
                     state.mark_sent(coin, tf, signal["direction"], candle)
                     logger.info("SIGNAL: %s %s %s | age=%d sec", coin, tf, signal["direction"], signal_age)
