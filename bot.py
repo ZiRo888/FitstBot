@@ -179,14 +179,15 @@ def build_market_map(client):
     mapping = {}
     for coin in WATCHLIST:
         perps = [m for m in futures if _is_required_exchange(m.get("exchange")) and m.get("base_asset") == coin and m.get("quote_asset") == "USDT" and bool(m.get("is_perpetual")) and bool(m.get("has_ohlcv_data"))]
-        spot_candidates = None
+        # Сбрасываем Spot для каждой монеты, чтобы не переиспользовать рынок предыдущей.
+        spot = None
         for ex_code in SPOT_FALLBACK_EXCHANGES:
             candidates = [m for m in spots if str(m.get("exchange", "")).strip() == ex_code and m.get("base_asset") == coin and m.get("quote_asset") == "USDT" and "USDT" in str(m.get("symbol", "")).upper()]
             if candidates:
                 spot = sorted(candidates, key=lambda m: m["symbol"])[0]
                 break
-        if not perps or not spot:
-            raise DataError(f"{coin}: нет данных на Binance/Bybit")
+        if not perps or spot is None:
+            raise DataError(f"{coin}: не найден подходящий Spot или perpetual рынок")
         perps.sort(key=lambda m: (not bool(m.get("has_long_short_ratio_data")), m["symbol"]))
         mapping[coin] = {"spot": spot, "perp": perps[0]}
         logger.info("%s | spot=%s | perp=%s", coin, spot["symbol"], perps[0]["symbol"])
@@ -365,23 +366,45 @@ class StateStore:
 
 def load_market_data(client, market, tf, boundary, coin="?"):
     perp_sym, spot_sym = market["perp"]["symbol"], market["spot"]["symbol"]
+
+    # Получаем источники отдельно и сразу записываем размер каждой выборки.
     perp = client.history("ohlcv-history", perp_sym, tf, boundary, ["o", "h", "l", "c", "v", "bv"])
+    logger.info("DATA PART | %s %s | Perp=%d", coin, tf, len(perp))
+
     spot = client.history("ohlcv-history", spot_sym, tf, boundary, ["v", "bv"])
+    logger.info("DATA PART | %s %s | Spot=%d", coin, tf, len(spot))
+
     oi = client.history("open-interest-history", perp_sym, tf, boundary, ["c"])
+    logger.info("DATA PART | %s %s | OI=%d", coin, tf, len(oi))
+
     funding = client.history("funding-rate-history", perp_sym, tf, boundary, ["c"])
+    logger.info("DATA PART | %s %s | Funding=%d", coin, tf, len(funding))
 
     frame = perp.join(spot.rename(columns={"v": "spot_volume", "bv": "spot_buy_volume"}), how="inner")
+    count_after_spot = len(frame)
     frame = frame.join(oi.rename(columns={"c": "oi"}), how="inner")
+    count_after_oi = len(frame)
     frame = frame.join(funding.rename(columns={"c": "funding"}), how="inner")
+    logger.info(
+        "DATA JOIN | %s %s | Perp=%d Spot=%d OI=%d Funding=%d | after_spot=%d after_oi=%d final=%d",
+        coin, tf, len(perp), len(spot), len(oi), len(funding),
+        count_after_spot, count_after_oi, len(frame)
+    )
+
     frame["long_liq"], frame["short_liq"] = 0.0, 0.0
     frame["ls_ratio"] = np.nan
 
-    seconds = TIMEFRAMES[tf][0]
-    if len(frame) < REQUIRED_BARS: raise DataError(f"Мало баров: {len(frame)}")
+    if len(frame) < REQUIRED_BARS:
+        raise DataError(
+            f"Мало баров после inner join: {len(frame)} < {REQUIRED_BARS} "
+            f"(Perp={len(perp)}, Spot={len(spot)}, OI={len(oi)}, Funding={len(funding)})"
+        )
     return add_indicators(frame)
 
 def send_telegram(text):
-    if DRY_RUN: return logger.info("DRY_RUN: %s", text)
+    if DRY_RUN:
+        logger.info("DRY_RUN: %s", text)
+        return True
     try:
         res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=20)
         return res.status_code == 200
@@ -406,48 +429,84 @@ def main():
     client = CoinalyzeClient()
     state = StateStore()
     cache, processed = {}, set()
+    retry_after = {}  # (coin, timeframe, boundary) -> unix timestamp следующей попытки
+
+    # В текущей загрузке L/S Ratio не запрашивается, поэтому фактически доступны 8 баллов.
+    logger.info(
+        "CONFIG | WATCHLIST=%s | TIMEFRAMES=%s | MIN_SCORE=%d | REQUIRED_BARS=%d | DRY_RUN=%s",
+        ",".join(WATCHLIST), ",".join(LOAD_ORDER), MIN_SCORE, REQUIRED_BARS, DRY_RUN
+    )
+    if MIN_SCORE > 8:
+        logger.warning(
+            "CONFIG WARNING | MIN_SCORE=%d выше текущего максимума 8: сигналы не пройдут score-фильтр "
+            "(L/S Ratio пока не загружается)", MIN_SCORE
+        )
 
     send_telegram(f"🚀 <b>Order Flow (Упрощенный) запущен</b>\nМонеты: {', '.join(WATCHLIST)}\nРежим: {'DRY RUN' if DRY_RUN else 'LIVE'}")
-    HEALTH["status"] = "running"
+    HEALTH["status"] = "starting"
     market_map = build_market_map(client)
+    HEALTH["status"] = "running"
 
     while True:
-        # ИСПРАВЛЕНО: добавлены скобки для правильного округления времени
-        boundaries = {tf: ((int(time.time()) - CLOSE_DELAY) // s[0]) * s[0] for tf, s in TIMEFRAMES.items()}
-        
+        now = int(time.time())
+        boundaries = {tf: ((now - CLOSE_DELAY) // spec[0]) * spec[0] for tf, spec in TIMEFRAMES.items()}
+
         for tf in LOAD_ORDER:
             for coin in WATCHLIST:
                 key = (coin, tf)
-                if cache.get(key) and cache[key]["boundary"] == boundaries[tf]: continue
+                boundary = boundaries[tf]
+                if cache.get(key) and cache[key]["boundary"] == boundary:
+                    continue
+
+                retry_key = (coin, tf, boundary)
+                retry_time = retry_after.get(retry_key, 0)
+                if now < retry_time:
+                    continue
+
                 try:
-                    frame = load_market_data(client, market_map[coin], tf, boundaries[tf], coin)
-                    cache[key] = {"boundary": boundaries[tf], "frame": frame}
+                    frame = load_market_data(client, market_map[coin], tf, boundary, coin)
+                    cache[key] = {"boundary": boundary, "frame": frame}
+                    retry_after.pop(retry_key, None)
+                    HEALTH["last_data_success"] = int(time.time())
+                    HEALTH["last_error"] = None
+                    HEALTH["status"] = "running"
                     logger.info("DATA OK | %s %s | bars=%s", coin, tf, len(frame))
                 except Exception as exc:
-                    logger.warning("DATA ERR | %s %s | %s", coin, tf, exc)
-                    time.sleep(10)
+                    retry_after[retry_key] = int(time.time()) + DATA_RETRY_SECONDS
+                    HEALTH["last_error"] = f"{coin} {tf}: {type(exc).__name__}: {exc}"
+                    HEALTH["status"] = "degraded"
+                    logger.warning(
+                        "DATA ERR | %s %s | %s | повтор после %d сек",
+                        coin, tf, exc, DATA_RETRY_SECONDS
+                    )
 
         for tf in LOAD_ORDER:
             for coin in WATCHLIST:
                 rec = cache.get((coin, tf))
-                if not rec or rec["boundary"] != boundaries[tf]: continue
+                if not rec or rec["boundary"] != boundaries[tf]:
+                    continue
                 frame = rec["frame"]
                 candle = int(frame.index[-1])
                 work_key = (coin, tf, candle)
-                if work_key in processed: continue
+                if work_key in processed:
+                    continue
 
                 candidates, explanation = analyze_orderflow(frame)
                 if not candidates:
                     logger.info("%s %s | skip: %s", coin, tf, explanation)
-                    processed.add(work_key); continue
+                    processed.add(work_key)
+                    continue
 
                 signal = candidates[0]
-                if not state.already_sent(coin, tf, signal["direction"], candle):
-                    message = format_signal(coin, tf, candle, signal, market_map[coin])
-                    if send_telegram(message):
-                        state.mark_sent(coin, tf, signal["direction"], candle)
-                        logger.info("SIGNAL: %s %s %s", coin, tf, signal["direction"])
-                        processed.add(work_key)
+                if state.already_sent(coin, tf, signal["direction"], candle):
+                    processed.add(work_key)
+                    continue
+
+                message = format_signal(coin, tf, candle, signal, market_map[coin])
+                if send_telegram(message):
+                    state.mark_sent(coin, tf, signal["direction"], candle)
+                    logger.info("SIGNAL: %s %s %s", coin, tf, signal["direction"])
+                    processed.add(work_key)
 
         HEALTH["last_cycle"] = int(time.time())
         time.sleep(30)
