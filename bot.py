@@ -457,8 +457,8 @@ def main():
 
     # В текущей загрузке L/S Ratio не запрашивается, поэтому фактически доступны 8 баллов.
     logger.info(
-        "CONFIG | REQUESTED_WATCHLIST=%s | TIMEFRAMES=%s | MIN_SCORE=%d | REQUIRED_BARS=%d | DRY_RUN=%s",
-        ",".join(WATCHLIST), ",".join(LOAD_ORDER), MIN_SCORE, REQUIRED_BARS, DRY_RUN
+        "CONFIG | REQUESTED_WATCHLIST=%s | TIMEFRAMES=%s | MIN_SCORE=%d | REQUIRED_BARS=%d | MAX_SIGNAL_DELAY=%d sec | DRY_RUN=%s",
+        ",".join(WATCHLIST), ",".join(LOAD_ORDER), MIN_SCORE, REQUIRED_BARS, MAX_SIGNAL_DELAY, DRY_RUN
     )
     if MIN_SCORE > 8:
         logger.warning(
@@ -524,6 +524,20 @@ def main():
                 if work_key in processed:
                     continue
 
+                # Не отправляем исторические сигналы при старте или после задержки API.
+                # candle — время открытия свечи; прибавляем длительность TF, чтобы получить
+                # фактическое время её закрытия.
+                candle_close_time = candle + TIMEFRAMES[tf][0]
+                signal_age = int(time.time()) - candle_close_time
+                if signal_age < 0 or signal_age > MAX_SIGNAL_DELAY:
+                    logger.info(
+                        "SIGNAL SKIP STALE | %s %s | age=%d sec | max=%d sec | candle_close=%s",
+                        coin, tf, signal_age, MAX_SIGNAL_DELAY,
+                        datetime.fromtimestamp(candle_close_time, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    )
+                    processed.add(work_key)
+                    continue
+
                 candidates, explanation = analyze_orderflow(frame)
                 if not candidates:
                     logger.info("%s %s | skip: %s", coin, tf, explanation)
@@ -535,10 +549,21 @@ def main():
                     processed.add(work_key)
                     continue
 
+                # Повторная проверка непосредственно перед отправкой: анализ/очередь
+                # могли занять время, и сигнал мог выйти за допустимые 10 минут.
+                signal_age = int(time.time()) - candle_close_time
+                if signal_age < 0 or signal_age > MAX_SIGNAL_DELAY:
+                    logger.info(
+                        "SIGNAL SKIP STALE BEFORE SEND | %s %s | age=%d sec | max=%d sec",
+                        coin, tf, signal_age, MAX_SIGNAL_DELAY
+                    )
+                    processed.add(work_key)
+                    continue
+
                 message = format_signal(coin, tf, candle, signal, market_map[coin])
                 if send_telegram(message):
                     state.mark_sent(coin, tf, signal["direction"], candle)
-                    logger.info("SIGNAL: %s %s %s", coin, tf, signal["direction"])
+                    logger.info("SIGNAL: %s %s %s | age=%d sec", coin, tf, signal["direction"], signal_age)
                     processed.add(work_key)
 
         HEALTH["last_cycle"] = int(time.time())
