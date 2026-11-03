@@ -27,7 +27,7 @@ DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
 
 coins = [
     value.strip().upper()
-    for value in os.getenv("WATCHLIST", "BTC").split(",")
+    for value in os.getenv("WATCHLIST", "BTC,SOL,XRP,BNB,DOGE,LINK").split(",")
     if value.strip()
 ]
 
@@ -107,21 +107,37 @@ class DataError(Exception): pass
 class AuthenticationError(Exception): pass
 
 class CoinalyzeClient:
+    # Оставляем запас относительно лимита Coinalyze (40 запросов/мин).
+    # Учитываем каждый HTTP-запрос, включая повторные попытки после ошибок.
+    MAX_CALLS_PER_WINDOW = 30
+    WINDOW_SECONDS = 61.0
+    MIN_REQUEST_GAP = 2.1
+
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"api_key": COINALYZE_API_KEY, "Accept": "application/json"})
         self.calls = deque()
         self.last_call = 0.0
+        self.total_calls = 0
+        self.rate_lock = threading.Lock()
 
     def wait_for_slot(self):
-        while True:
-            now = time.monotonic()
-            while self.calls and now - self.calls[0] >= 61: self.calls.popleft()
-            delay = max(0.0, self.last_call + 2.1 - now)
-            if len(self.calls) >= 30: delay = max(delay, self.calls[0] + 61 - now)
-            if delay <= 0:
-                self.calls.append(now); self.last_call = now; return
-            time.sleep(delay + 0.05)
+        # Один общий диспетчер для всех монет, таймфреймов и повторных запросов.
+        # Lock не позволяет двум потокам одновременно занять один слот.
+        with self.rate_lock:
+            while True:
+                now = time.monotonic()
+                while self.calls and now - self.calls[0] >= self.WINDOW_SECONDS:
+                    self.calls.popleft()
+                delay = max(0.0, self.last_call + self.MIN_REQUEST_GAP - now)
+                if len(self.calls) >= self.MAX_CALLS_PER_WINDOW:
+                    delay = max(delay, self.calls[0] + self.WINDOW_SECONDS - now)
+                if delay <= 0:
+                    self.calls.append(now)
+                    self.last_call = now
+                    self.total_calls += 1
+                    return
+                time.sleep(delay + 0.05)
 
     def get(self, endpoint, params=None):
         params = dict(params or {})
@@ -187,10 +203,18 @@ def build_market_map(client):
                 spot = sorted(candidates, key=lambda m: m["symbol"])[0]
                 break
         if not perps or spot is None:
-            raise DataError(f"{coin}: не найден подходящий Spot или perpetual рынок")
+            logger.warning(
+                "MARKET SKIP | %s | Perp=%s Spot=%s | монета исключена, остальные продолжат работу",
+                coin, bool(perps), bool(spot)
+            )
+            continue
         perps.sort(key=lambda m: (not bool(m.get("has_long_short_ratio_data")), m["symbol"]))
         mapping[coin] = {"spot": spot, "perp": perps[0]}
-        logger.info("%s | spot=%s | perp=%s", coin, spot["symbol"], perps[0]["symbol"])
+        logger.info("MARKET OK | %s | spot=%s (%s) | perp=%s", coin, spot["symbol"], exchange_name(spot.get("exchange")), perps[0]["symbol"])
+    if not mapping:
+        raise DataError("Не удалось найти ни одной монеты с подходящими Spot и perpetual рынками")
+    skipped = [coin for coin in WATCHLIST if coin not in mapping]
+    logger.info("MARKET SUMMARY | active=%s | skipped=%s", ",".join(mapping), ",".join(skipped) or "нет")
     return mapping
 
 # ============================================================
@@ -433,7 +457,7 @@ def main():
 
     # В текущей загрузке L/S Ratio не запрашивается, поэтому фактически доступны 8 баллов.
     logger.info(
-        "CONFIG | WATCHLIST=%s | TIMEFRAMES=%s | MIN_SCORE=%d | REQUIRED_BARS=%d | DRY_RUN=%s",
+        "CONFIG | REQUESTED_WATCHLIST=%s | TIMEFRAMES=%s | MIN_SCORE=%d | REQUIRED_BARS=%d | DRY_RUN=%s",
         ",".join(WATCHLIST), ",".join(LOAD_ORDER), MIN_SCORE, REQUIRED_BARS, DRY_RUN
     )
     if MIN_SCORE > 8:
@@ -445,6 +469,15 @@ def main():
     send_telegram(f"🚀 <b>Order Flow (Упрощенный) запущен</b>\nМонеты: {', '.join(WATCHLIST)}\nРежим: {'DRY RUN' if DRY_RUN else 'LIVE'}")
     HEALTH["status"] = "starting"
     market_map = build_market_map(client)
+    active_watchlist = list(market_map)
+    logger.info(
+        "SCHEDULER | активных монет=%d | таймфреймов=%d | запросов на полное обновление=%d | лимит=%d запросов/%d сек",
+        len(active_watchlist), len(TIMEFRAMES),
+        len(active_watchlist) * len(TIMEFRAMES) * 4,
+        client.MAX_CALLS_PER_WINDOW, int(client.WINDOW_SECONDS)
+    )
+    if len(active_watchlist) < 3:
+        logger.warning("WATCHLIST WARNING | доступно менее 3 монет: %s", ",".join(active_watchlist))
     HEALTH["status"] = "running"
 
     while True:
@@ -452,7 +485,7 @@ def main():
         boundaries = {tf: ((now - CLOSE_DELAY) // spec[0]) * spec[0] for tf, spec in TIMEFRAMES.items()}
 
         for tf in LOAD_ORDER:
-            for coin in WATCHLIST:
+            for coin in active_watchlist:
                 key = (coin, tf)
                 boundary = boundaries[tf]
                 if cache.get(key) and cache[key]["boundary"] == boundary:
@@ -481,7 +514,7 @@ def main():
                     )
 
         for tf in LOAD_ORDER:
-            for coin in WATCHLIST:
+            for coin in active_watchlist:
                 rec = cache.get((coin, tf))
                 if not rec or rec["boundary"] != boundaries[tf]:
                     continue
