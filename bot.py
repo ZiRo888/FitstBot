@@ -1,4 +1,3 @@
-
 import os
 import time
 import json
@@ -7,7 +6,7 @@ import logging
 import sqlite3
 import threading
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -27,17 +26,18 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
 
-# Часовой пояс отображения времени в Telegram.
-# Для Хабаровска: Asia/Vladivostok (UTC+10).
-TIMEZONE_NAME = os.getenv("TIMEZONE", "Asia/Vladivostok").strip()
+TIMEZONE_NAME = os.getenv(
+    "TIMEZONE",
+    "Asia/Vladivostok"
+).strip()
 
 try:
     LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_NAME)
 except (ZoneInfoNotFoundError, ValueError):
-    logger_timezone_error = (
-        f"Неизвестный TIMEZONE={TIMEZONE_NAME}; используется Asia/Vladivostok"
+    print(
+        f"Неизвестный TIMEZONE={TIMEZONE_NAME}; "
+        "используется Asia/Vladivostok"
     )
-    print(logger_timezone_error)
     TIMEZONE_NAME = "Asia/Vladivostok"
     LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_NAME)
 
@@ -59,12 +59,13 @@ TIMEFRAMES = {
 }
 
 LOAD_ORDER = ["4h", "1h"]
-HIGHER_TIMEFRAME = {"1h": "4h"}
 
 LOOKBACK_BARS = 100
 REQUIRED_BARS = 65
 
-CLOSE_DELAY = int(os.getenv("CLOSE_DELAY_SECONDS", "45"))
+CLOSE_DELAY = int(
+    os.getenv("CLOSE_DELAY_SECONDS", "45")
+)
 
 MAX_SIGNAL_DELAY_BY_TF = {
     "1h": int(os.getenv("MAX_SIGNAL_DELAY_1H_SECONDS", "3600")),
@@ -80,6 +81,7 @@ VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", "1.50"))
 FUNDING_LIMIT = float(os.getenv("FUNDING_LIMIT_PERCENT", "0.05"))
 FUNDING_PCT_LIMIT = float(os.getenv("FUNDING_PCT_LIMIT", "0.90"))
 FUNDING_WINDOW = int(os.getenv("FUNDING_WINDOW_BARS", "96"))
+
 MIN_LIQ_USD = float(os.getenv("MIN_LIQUIDATION_USD", "10000"))
 LIQ_MULTIPLIER = float(os.getenv("LIQUIDATION_SPIKE_MULTIPLIER", "3.0"))
 
@@ -88,6 +90,7 @@ TELEGRAM_RETRY_SECONDS = 60
 SPOT_RECHECK_SECONDS = 900
 
 STATE_DB = os.getenv("STATE_DB", "bot_state.sqlite3")
+
 REQUIRED_EXCHANGE = "A"
 SPOT_FALLBACK_EXCHANGES = ["A", "O", "B", "C"]
 
@@ -109,7 +112,7 @@ HEALTH = {
 
 
 # ============================================================
-# HEALTH-СЕРВЕР & ПИНГЕР
+# HEALTH-СЕРВЕР И ПИНГЕР
 # ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -136,7 +139,6 @@ def start_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
 
     logger.info("Health server: port %s", port)
-
     server.serve_forever()
 
 
@@ -152,12 +154,10 @@ def self_ping_worker():
     while True:
         try:
             res = requests.get(url, timeout=10)
-
             logger.info(
                 "Self-ping OK | HTTP %s",
                 res.status_code
             )
-
         except Exception as exc:
             logger.warning(
                 "Self-ping failed: %s",
@@ -250,9 +250,12 @@ class CoinalyzeClient:
                 )
 
             if response.status_code == 429:
-                delay = float(
-                    response.headers.get("Retry-After", "60")
-                )
+                try:
+                    delay = float(
+                        response.headers.get("Retry-After", "60")
+                    )
+                except (TypeError, ValueError):
+                    delay = 60
 
                 logger.warning(
                     "Coinalyze 429 | Сплю %.1f секунд",
@@ -273,7 +276,6 @@ class CoinalyzeClient:
 
             try:
                 result = response.json()
-
             except ValueError:
                 time.sleep(2 ** attempt)
                 continue
@@ -354,6 +356,55 @@ class CoinalyzeClient:
             frame.index + seconds <= boundary
         ]
 
+    def optional_history(
+        self,
+        endpoint,
+        symbol,
+        tf,
+        boundary,
+        columns,
+        usd=False
+    ):
+        """
+        Необязательная история.
+        Если endpoint не отдаёт данные, возвращает пустой DataFrame.
+        Ошибку авторизации не скрывает.
+        """
+
+        try:
+            return self.history(
+                endpoint,
+                symbol,
+                tf,
+                boundary,
+                columns,
+                usd=usd
+            )
+
+        except AuthenticationError:
+            raise
+
+        except DataError as exc:
+            logger.warning(
+                "OPTIONAL DATA UNAVAILABLE | %s | %s | %s",
+                endpoint,
+                symbol,
+                exc
+            )
+
+        except Exception as exc:
+            logger.warning(
+                "OPTIONAL DATA ERROR | %s | %s | %s",
+                endpoint,
+                symbol,
+                exc
+            )
+
+        return pd.DataFrame(
+            columns=columns,
+            index=pd.Index([], name="t")
+        )
+
 
 def _is_required_exchange(market_exchange):
     value = str(market_exchange or "").strip()
@@ -386,8 +437,6 @@ def exchange_name(code):
 # ============================================================
 
 def find_spot_market(client, coin, tf):
-    """Повторно ищет Spot-рынок с достаточной историей для TF."""
-
     spots = client.get("spot-markets")
 
     now = int(time.time())
@@ -443,7 +492,6 @@ def find_spot_market(client, coin, tf):
                     exchange_name(candidate.get("exchange")),
                     bars
                 )
-
                 return candidate
 
             logger.info(
@@ -570,7 +618,6 @@ def build_market_map(client):
                             exchange_name(candidate.get("exchange")),
                             bars
                         )
-
                         break
 
                     logger.warning(
@@ -623,10 +670,11 @@ def build_market_map(client):
         )
 
         logger.info(
-            "MARKET OK | %s | spot[%s] | perp=%s",
+            "MARKET OK | %s | spot[%s] | perp=%s | L/S=%s",
             coin,
             selected_text,
-            perps[0]["symbol"]
+            perps[0]["symbol"],
+            bool(perps[0].get("has_long_short_ratio_data"))
         )
 
     if not mapping:
@@ -801,13 +849,21 @@ def detect_divergence(
     return False
 
 
+def finite_value(value):
+    try:
+        result = float(value)
+        return result if np.isfinite(result) else None
+    except (TypeError, ValueError):
+        return None
+
+
 def analyze_orderflow(frame):
     current = frame.iloc[-1]
     previous = frame.iloc[-2]
 
-    atr = float(frame["atr"].iloc[-2])
+    atr = finite_value(frame["atr"].iloc[-2])
 
-    if not np.isfinite(atr) or atr <= 0:
+    if atr is None or atr <= 0:
         return [], "Некорректный ATR"
 
     candle_range = current["h"] - current["l"]
@@ -896,14 +952,29 @@ def analyze_orderflow(frame):
         and body < 0
     )
 
-    funding = float(current["funding"])
+    funding = finite_value(current["funding"])
 
-    funding_pct = float(
+    if funding is None:
+        return [], "Нет корректного Funding"
+
+    funding_pct = finite_value(
         rolling_pct(
             frame["funding"],
             FUNDING_WINDOW
         ).iloc[-1]
     )
+
+    if funding_pct is None:
+        funding_pct = 0.5
+
+    # Дополнительные метрики. Только информационные.
+    # Они НЕ участвуют в расчёте score.
+    ls_ratio = finite_value(current.get("ls_ratio"))
+    ls_long_pct = finite_value(current.get("ls_long_pct"))
+    ls_short_pct = finite_value(current.get("ls_short_pct"))
+
+    long_liq = finite_value(current.get("long_liq_usd"))
+    short_liq = finite_value(current.get("short_liq_usd"))
 
     candidates = []
     rejected = []
@@ -1001,19 +1072,8 @@ def analyze_orderflow(frame):
             score += 1
             reasons.append("Объём")
 
-        ratio = (
-            float(current["ls_ratio"])
-            if pd.notna(current.get("ls_ratio"))
-            else None
-        )
-
-        if ratio is not None and (
-            (is_long and ratio < 0.8)
-            or (not is_long and ratio > 1.25)
-        ):
-            score += 1
-            reasons.append("L/S")
-
+        # L/S Ratio намеренно НЕ добавляет баллы.
+        # Ликвидации намеренно НЕ меняют score.
         if score < MIN_SCORE:
             rejected.append(
                 f"{direction}: score={score}"
@@ -1036,9 +1096,11 @@ def analyze_orderflow(frame):
             "perp_delta_pct": float(
                 current["perp_share"] * 100
             ),
-            "long_liq": 0.0,
-            "short_liq": 0.0,
-            "ls_ratio": ratio,
+            "long_liq": long_liq,
+            "short_liq": short_liq,
+            "ls_ratio": ls_ratio,
+            "ls_long_pct": ls_long_pct,
+            "ls_short_pct": ls_short_pct,
             "fvg": bool(
                 bullish_fvg if is_long else bearish_fvg
             )
@@ -1052,12 +1114,6 @@ def analyze_orderflow(frame):
 # ============================================================
 
 def build_market_context(cache, active_watchlist, tf, boundaries):
-    """
-    Считает ширину рынка по уже загруженным данным.
-    Не делает дополнительных запросов к Coinalyze.
-    Не влияет на допуск или блокировку торгового сигнала.
-    """
-
     bullish = []
     bearish = []
     neutral = []
@@ -1067,10 +1123,7 @@ def build_market_context(cache, active_watchlist, tf, boundaries):
     for coin in active_watchlist:
         rec = cache.get((coin, tf))
 
-        if not rec:
-            continue
-
-        if rec.get("boundary") != target_boundary:
+        if not rec or rec.get("boundary") != target_boundary:
             continue
 
         frame = rec.get("frame")
@@ -1101,40 +1154,26 @@ def build_market_context(cache, active_watchlist, tf, boundaries):
     if total == 0:
         breadth_label = "Недостаточно данных"
         strength = "не определена"
-
     else:
         bullish_share = len(bullish) / total
         bearish_share = len(bearish) / total
 
-        if (
-            bullish_share >= 0.50
-            and len(bullish) > len(bearish)
-        ):
+        if bullish_share >= 0.50 and len(bullish) > len(bearish):
             breadth_label = "Bullish"
-
             strength = (
-                "сильное"
-                if bullish_share >= 0.67
+                "сильное" if bullish_share >= 0.67
                 else "умеренное"
             )
-
-        elif (
-            bearish_share >= 0.50
-            and len(bearish) > len(bullish)
-        ):
+        elif bearish_share >= 0.50 and len(bearish) > len(bullish):
             breadth_label = "Bearish"
-
             strength = (
-                "сильное"
-                if bearish_share >= 0.67
+                "сильное" if bearish_share >= 0.67
                 else "умеренное"
             )
-
         else:
             breadth_label = "Mixed / Neutral"
             strength = "смешанное"
 
-    # Отдельно проверяем BTC на 4H — основной рыночный ориентир.
     btc_context = "нет данных"
 
     btc_rec = cache.get(("BTC", "4h"))
@@ -1153,7 +1192,6 @@ def build_market_context(cache, active_watchlist, tf, boundaries):
                 "bearish": "Bearish",
                 "neutral": "Neutral"
             }.get(btc_value, "нет данных")
-
         except Exception:
             btc_context = "нет данных"
 
@@ -1179,7 +1217,6 @@ def format_market_context(context):
     bullish = context["bullish"]
     bearish = context["bearish"]
     neutral = context["neutral"]
-
     total = context["total"]
 
     lines = [
@@ -1222,9 +1259,7 @@ class StateStore:
     def already_sent(self, coin, tf, direction, candle):
         mode = "dry" if DRY_RUN else "live"
 
-        sid = (
-            f"{coin}:{tf}:{direction}:{candle}:{mode}"
-        )
+        sid = f"{coin}:{tf}:{direction}:{candle}:{mode}"
 
         return self.db.execute(
             "SELECT 1 FROM of_signals WHERE id=?",
@@ -1234,9 +1269,7 @@ class StateStore:
     def mark_sent(self, coin, tf, direction, candle):
         mode = "dry" if DRY_RUN else "live"
 
-        sid = (
-            f"{coin}:{tf}:{direction}:{candle}:{mode}"
-        )
+        sid = f"{coin}:{tf}:{direction}:{candle}:{mode}"
 
         self.db.execute(
             "INSERT OR IGNORE INTO of_signals VALUES (?, ?, ?, ?, ?, ?)",
@@ -1278,6 +1311,7 @@ def load_market_data(
     perp_sym = market["perp"]["symbol"]
     spot_sym = spot_market["symbol"]
 
+    # Основные данные — обязательные.
     perp = client.history(
         "ohlcv-history",
         perp_sym,
@@ -1288,9 +1322,7 @@ def load_market_data(
 
     logger.info(
         "DATA PART | %s %s | Perp=%d",
-        coin,
-        tf,
-        len(perp)
+        coin, tf, len(perp)
     )
 
     spot = client.history(
@@ -1303,9 +1335,7 @@ def load_market_data(
 
     logger.info(
         "DATA PART | %s %s | Spot=%d",
-        coin,
-        tf,
-        len(spot)
+        coin, tf, len(spot)
     )
 
     oi = client.history(
@@ -1318,9 +1348,7 @@ def load_market_data(
 
     logger.info(
         "DATA PART | %s %s | OI=%d",
-        coin,
-        tf,
-        len(oi)
+        coin, tf, len(oi)
     )
 
     funding = client.history(
@@ -1333,11 +1361,39 @@ def load_market_data(
 
     logger.info(
         "DATA PART | %s %s | Funding=%d",
-        coin,
-        tf,
-        len(funding)
+        coin, tf, len(funding)
     )
 
+    # Дополнительные данные — необязательные.
+    # Ошибка этих endpoint не должна ломать основной анализ.
+    liquidations = client.optional_history(
+        "liquidation-history",
+        perp_sym,
+        tf,
+        boundary,
+        ["l", "s"],
+        usd=True
+    )
+
+    has_ls_data = bool(
+        market["perp"].get("has_long_short_ratio_data")
+    )
+
+    if has_ls_data:
+        ls_history = client.optional_history(
+            "long-short-ratio-history",
+            perp_sym,
+            tf,
+            boundary,
+            ["r", "l", "s"]
+        )
+    else:
+        ls_history = pd.DataFrame(
+            columns=["r", "l", "s"],
+            index=pd.Index([], name="t")
+        )
+
+    # Сборка основных данных.
     frame = perp.join(
         spot.rename(
             columns={
@@ -1351,24 +1407,65 @@ def load_market_data(
     count_after_spot = len(frame)
 
     frame = frame.join(
-        oi.rename(
-            columns={"c": "oi"}
-        ),
+        oi.rename(columns={"c": "oi"}),
         how="inner"
     )
 
     count_after_oi = len(frame)
 
     frame = frame.join(
-        funding.rename(
-            columns={"c": "funding"}
-        ),
+        funding.rename(columns={"c": "funding"}),
         how="inner"
     )
 
+    count_after_funding = len(frame)
+
+    # Ликвидации: l — ликвидации LONG, s — ликвидации SHORT.
+    if not liquidations.empty:
+        liquidations = liquidations.rename(
+            columns={
+                "l": "long_liq_usd",
+                "s": "short_liq_usd"
+            }
+        )
+
+        frame = frame.join(
+            liquidations[
+                ["long_liq_usd", "short_liq_usd"]
+            ],
+            how="left"
+        )
+    else:
+        frame["long_liq_usd"] = np.nan
+        frame["short_liq_usd"] = np.nan
+
+    # Long/Short Ratio:
+    # r — коэффициент Long/Short;
+    # l — доля Long в процентах;
+    # s — доля Short в процентах.
+    if not ls_history.empty:
+        ls_history = ls_history.rename(
+            columns={
+                "r": "ls_ratio",
+                "l": "ls_long_pct",
+                "s": "ls_short_pct"
+            }
+        )
+
+        frame = frame.join(
+            ls_history[
+                ["ls_ratio", "ls_long_pct", "ls_short_pct"]
+            ],
+            how="left"
+        )
+    else:
+        frame["ls_ratio"] = np.nan
+        frame["ls_long_pct"] = np.nan
+        frame["ls_short_pct"] = np.nan
+
     logger.info(
         "DATA JOIN | %s %s | Perp=%d Spot=%d OI=%d Funding=%d | "
-        "after_spot=%d after_oi=%d final=%d",
+        "after_spot=%d after_oi=%d after_funding=%d final=%d",
         coin,
         tf,
         len(perp),
@@ -1377,14 +1474,20 @@ def load_market_data(
         len(funding),
         count_after_spot,
         count_after_oi,
+        count_after_funding,
         len(frame)
     )
 
-    # Пока реальные исторические ликвидации и L/S Ratio
-    # не подключены. Не выдаём нули за реальные данные.
-    frame["long_liq"] = np.nan
-    frame["short_liq"] = np.nan
-    frame["ls_ratio"] = np.nan
+    logger.info(
+        "DERIVATIVES DATA | %s %s | "
+        "Liquidations points=%d | L/S points=%d | "
+        "L/S supported=%s",
+        coin,
+        tf,
+        len(liquidations),
+        len(ls_history),
+        has_ls_data
+    )
 
     if len(frame) < REQUIRED_BARS:
         raise DataError(
@@ -1394,6 +1497,45 @@ def load_market_data(
         )
 
     return add_indicators(frame)
+
+
+# ============================================================
+# ФОРМАТИРОВАНИЕ ДОПОЛНИТЕЛЬНЫХ ДАННЫХ
+# ============================================================
+
+def format_usd(value):
+    value = finite_value(value)
+
+    if value is None:
+        return "N/A"
+
+    absolute = abs(value)
+
+    if absolute >= 1_000_000:
+        return f"${value / 1_000_000:,.2f}M"
+
+    if absolute >= 1_000:
+        return f"${value / 1_000:,.1f}K"
+
+    return f"${value:,.0f}"
+
+
+def format_ratio(value):
+    value = finite_value(value)
+
+    if value is None:
+        return "N/A"
+
+    return f"{value:.2f}"
+
+
+def format_percent(value):
+    value = finite_value(value)
+
+    if value is None:
+        return "N/A"
+
+    return f"{value:.1f}%"
 
 
 # ============================================================
@@ -1455,8 +1597,6 @@ def format_signal(
         int(detected_at) - signal_time
     )
 
-    # Конвертируем только отображение времени.
-    # Unix timestamp и внутренние расчёты остаются UTC.
     signal_time_text = datetime.fromtimestamp(
         signal_time,
         LOCAL_TIMEZONE
@@ -1474,6 +1614,13 @@ def format_signal(
         if signal["direction"] == "LONG"
         else "🔴"
     )
+
+    ls_ratio = format_ratio(signal.get("ls_ratio"))
+    ls_long = format_percent(signal.get("ls_long_pct"))
+    ls_short = format_percent(signal.get("ls_short_pct"))
+
+    long_liq = format_usd(signal.get("long_liq"))
+    short_liq = format_usd(signal.get("short_liq"))
 
     lines = [
         (
@@ -1493,13 +1640,23 @@ def format_signal(
         ),
         f"Возраст сигнала: {age_minutes} мин.",
         f"Сетап: {signal['setup']}",
-        f"Баллы: {signal['score']}/10",
+        f"Баллы: {signal['score']}/8",
         "",
-        f"📊 Spot: {signal['spot_delta_pct']:+.1f}%",
-        f"📊 Perp: {signal['perp_delta_pct']:+.1f}%",
+        "📊 <b>ORDER FLOW</b>",
+        f"Spot Delta: {signal['spot_delta_pct']:+.1f}%",
+        f"Perp Delta: {signal['perp_delta_pct']:+.1f}%",
         f"🏦 OI: {signal['oi_change']:+.2f}%",
         f"💰 Funding: {signal['funding']:+.4f}%",
-        ""
+        "",
+        "⚖️ <b>LONG / SHORT RATIO</b>",
+        f"L/S Ratio: <b>{ls_ratio}</b>",
+        f"Long accounts: {ls_long}",
+        f"Short accounts: {ls_short}",
+        "",
+        "💥 <b>LIQUIDATIONS</b>",
+        f"Long liquidations: <b>{long_liq}</b>",
+        f"Short liquidations: <b>{short_liq}</b>",
+        "",
     ]
 
     lines.extend(
@@ -1509,8 +1666,14 @@ def format_signal(
     lines.extend([
         "",
         (
-            "ℹ️ Рыночный контекст — дополнительная информация, "
-            "не гарантия движения цены."
+            "ℹ️ L/S Ratio и ликвидации — дополнительные "
+            "рыночные данные. На баллы и формирование сигнала "
+            "пока не влияют."
+        ),
+        (
+            "⚠️ Ликвидации показывают объём в USD по данным "
+            "поддерживаемого Coinalyze рынка, а не количество "
+            "ликвидированных трейдеров."
         )
     ])
 
@@ -1538,7 +1701,6 @@ def main():
     cache = {}
     processed = set()
     retry_after = {}
-
     spot_retry_after = {}
 
     logger.info(
@@ -1559,8 +1721,7 @@ def main():
     if MIN_SCORE > 8:
         logger.warning(
             "CONFIG WARNING | MIN_SCORE=%d выше текущего максимума 8: "
-            "сигналы не пройдут score-фильтр "
-            "(L/S Ratio пока не загружается)",
+            "сигналы не пройдут score-фильтр",
             MIN_SCORE
         )
 
@@ -1577,12 +1738,18 @@ def main():
     market_map = build_market_map(client)
     active_watchlist = list(market_map)
 
+    # На каждую монету и TF:
+    # 4 обязательных + 2 дополнительных запроса.
+    estimated_calls = (
+        len(active_watchlist) * len(TIMEFRAMES) * 6
+    )
+
     logger.info(
         "SCHEDULER | активных монет=%d | таймфреймов=%d | "
-        "запросов на полное обновление=%d | лимит=%d запросов/%d сек",
+        "запросов на полное обновление до=%d | лимит=%d запросов/%d сек",
         len(active_watchlist),
         len(TIMEFRAMES),
-        len(active_watchlist) * len(TIMEFRAMES) * 4,
+        estimated_calls,
         client.MAX_CALLS_PER_WINDOW,
         int(client.WINDOW_SECONDS)
     )
@@ -1873,7 +2040,6 @@ def main():
                     processed.add(work_key)
                     continue
 
-                # Повторная проверка непосредственно перед отправкой.
                 detected_at = int(time.time())
 
                 signal_age = (
