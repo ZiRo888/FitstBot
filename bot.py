@@ -578,12 +578,26 @@ def main():
                     HEALTH["status"] = "running"
                     logger.info("DATA OK | %s %s | bars=%s", coin, tf, len(frame))
                 except Exception as exc:
-                    retry_after[retry_key] = int(time.time()) + DATA_RETRY_SECONDS
+                    # Если не хватает свечей после inner join, повторять те же
+                    # запросы каждые 120 секунд бесполезно: ждём закрытия следующей
+                    # свечи этого TF. REQUIRED_BARS и торговая логика не меняются.
+                    error_text = str(exc)
+                    if "Мало баров после inner join" in error_text:
+                        retry_seconds = max(
+                            DATA_RETRY_SECONDS,
+                            boundary + TIMEFRAMES[tf][0] + CLOSE_DELAY - int(time.time())
+                        )
+                        retry_after[retry_key] = int(time.time()) + retry_seconds
+                        retry_message = "повтор после следующей свечи (примерно %d сек)" % retry_seconds
+                    else:
+                        retry_after[retry_key] = int(time.time()) + DATA_RETRY_SECONDS
+                        retry_message = "повтор после %d сек" % DATA_RETRY_SECONDS
+
                     HEALTH["last_error"] = f"{coin} {tf}: {type(exc).__name__}: {exc}"
                     HEALTH["status"] = "degraded"
                     logger.warning(
-                        "DATA ERR | %s %s | %s | повтор после %d сек",
-                        coin, tf, exc, DATA_RETRY_SECONDS
+                        "DATA ERR | %s %s | %s | %s",
+                        coin, tf, exc, retry_message
                     )
 
         for tf in LOAD_ORDER:
