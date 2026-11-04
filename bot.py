@@ -1,3 +1,4 @@
+
 import os
 import time
 import json
@@ -7,6 +8,7 @@ import sqlite3
 import threading
 from collections import deque
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import numpy as np
@@ -25,9 +27,27 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
 
+# Часовой пояс отображения времени в Telegram.
+# Для Хабаровска: Asia/Vladivostok (UTC+10).
+TIMEZONE_NAME = os.getenv("TIMEZONE", "Asia/Vladivostok").strip()
+
+try:
+    LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_NAME)
+except (ZoneInfoNotFoundError, ValueError):
+    logger_timezone_error = (
+        f"Неизвестный TIMEZONE={TIMEZONE_NAME}; используется Asia/Vladivostok"
+    )
+    print(logger_timezone_error)
+    TIMEZONE_NAME = "Asia/Vladivostok"
+    LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_NAME)
+
+
 coins = [
     value.strip().upper()
-    for value in os.getenv("WATCHLIST", "BTC,SOL,XRP,BNB,DOGE,LINK").split(",")
+    for value in os.getenv(
+        "WATCHLIST",
+        "BTC,SOL,XRP,BNB,DOGE,LINK"
+    ).split(",")
     if value.strip()
 ]
 
@@ -37,6 +57,7 @@ TIMEFRAMES = {
     "1h": (3600, "1hour"),
     "4h": (14400, "4hour"),
 }
+
 LOAD_ORDER = ["4h", "1h"]
 HIGHER_TIMEFRAME = {"1h": "4h"}
 
@@ -45,8 +66,6 @@ REQUIRED_BARS = 65
 
 CLOSE_DELAY = int(os.getenv("CLOSE_DELAY_SECONDS", "45"))
 
-# Максимальный возраст сигнала при отправке: отдельно для каждого таймфрейма.
-# Значение можно переопределить через Render Environment.
 MAX_SIGNAL_DELAY_BY_TF = {
     "1h": int(os.getenv("MAX_SIGNAL_DELAY_1H_SECONDS", "3600")),
     "4h": int(os.getenv("MAX_SIGNAL_DELAY_4H_SECONDS", "14400")),
@@ -66,10 +85,10 @@ LIQ_MULTIPLIER = float(os.getenv("LIQUIDATION_SPIKE_MULTIPLIER", "3.0"))
 
 DATA_RETRY_SECONDS = 120
 TELEGRAM_RETRY_SECONDS = 60
-SPOT_RECHECK_SECONDS = 900  # Повторный поиск отсутствующего Spot раз в 15 минут
+SPOT_RECHECK_SECONDS = 900
 
 STATE_DB = os.getenv("STATE_DB", "bot_state.sqlite3")
-REQUIRED_EXCHANGE = "A"  # Binance
+REQUIRED_EXCHANGE = "A"
 SPOT_FALLBACK_EXCHANGES = ["A", "O", "B", "C"]
 
 NL = chr(10)
@@ -78,6 +97,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
+
 logger = logging.getLogger("orderflow")
 
 HEALTH = {
@@ -94,9 +114,16 @@ HEALTH = {
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = json.dumps(HEALTH, ensure_ascii=False).encode("utf-8")
+        body = json.dumps(
+            HEALTH,
+            ensure_ascii=False
+        ).encode("utf-8")
+
         self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8"
+        )
         self.end_headers()
         self.wfile.write(body)
 
@@ -107,7 +134,9 @@ class HealthHandler(BaseHTTPRequestHandler):
 def start_health_server():
     port = int(os.getenv("PORT", "10000"))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
+
     logger.info("Health server: port %s", port)
+
     server.serve_forever()
 
 
@@ -123,9 +152,17 @@ def self_ping_worker():
     while True:
         try:
             res = requests.get(url, timeout=10)
-            logger.info("Self-ping OK | HTTP %s", res.status_code)
+
+            logger.info(
+                "Self-ping OK | HTTP %s",
+                res.status_code
+            )
+
         except Exception as exc:
-            logger.warning("Self-ping failed: %s", type(exc).__name__)
+            logger.warning(
+                "Self-ping failed: %s",
+                type(exc).__name__
+            )
 
         time.sleep(600)
 
@@ -143,31 +180,32 @@ class AuthenticationError(Exception):
 
 
 class CoinalyzeClient:
-    # Оставляем запас относительно лимита Coinalyze (40 запросов/мин).
-    # Учитываем каждый HTTP-запрос, включая повторные попытки после ошибок.
     MAX_CALLS_PER_WINDOW = 30
     WINDOW_SECONDS = 61.0
     MIN_REQUEST_GAP = 2.1
 
     def __init__(self):
         self.session = requests.Session()
+
         self.session.headers.update({
             "api_key": COINALYZE_API_KEY,
             "Accept": "application/json"
         })
+
         self.calls = deque()
         self.last_call = 0.0
         self.total_calls = 0
         self.rate_lock = threading.Lock()
 
     def wait_for_slot(self):
-        # Один общий диспетчер для всех монет, таймфреймов и повторных запросов.
-        # Lock не позволяет двум потокам одновременно занять один слот.
         with self.rate_lock:
             while True:
                 now = time.monotonic()
 
-                while self.calls and now - self.calls[0] >= self.WINDOW_SECONDS:
+                while (
+                    self.calls
+                    and now - self.calls[0] >= self.WINDOW_SECONDS
+                ):
                     self.calls.popleft()
 
                 delay = max(
@@ -201,6 +239,7 @@ class CoinalyzeClient:
                     params=params,
                     timeout=25
                 )
+
             except requests.RequestException:
                 time.sleep(2 ** attempt)
                 continue
@@ -214,10 +253,12 @@ class CoinalyzeClient:
                 delay = float(
                     response.headers.get("Retry-After", "60")
                 )
+
                 logger.warning(
                     "Coinalyze 429 | Сплю %.1f секунд",
                     delay
                 )
+
                 time.sleep(max(1, delay))
                 continue
 
@@ -232,6 +273,7 @@ class CoinalyzeClient:
 
             try:
                 result = response.json()
+
             except ValueError:
                 time.sleep(2 ** attempt)
                 continue
@@ -243,9 +285,19 @@ class CoinalyzeClient:
 
             return result
 
-        raise DataError(f"{endpoint}: исчерпаны попытки")
+        raise DataError(
+            f"{endpoint}: исчерпаны попытки"
+        )
 
-    def history(self, endpoint, symbol, tf, boundary, columns, usd=False):
+    def history(
+        self,
+        endpoint,
+        symbol,
+        tf,
+        boundary,
+        columns,
+        usd=False
+    ):
         seconds, interval = TIMEFRAMES[tf]
 
         params = {
@@ -269,13 +321,17 @@ class CoinalyzeClient:
         )
 
         if entry is None or not entry.get("history"):
-            raise DataError(f"{endpoint}: нет истории {symbol}")
+            raise DataError(
+                f"{endpoint}: нет истории {symbol}"
+            )
 
         frame = pd.DataFrame(entry["history"])
         required = ["t"] + columns
 
         if not set(required).issubset(frame.columns):
-            raise DataError(f"{endpoint}: нет полей {required}")
+            raise DataError(
+                f"{endpoint}: нет полей {required}"
+            )
 
         frame = frame[required].copy()
 
@@ -286,7 +342,13 @@ class CoinalyzeClient:
             )
 
         frame["t"] = frame["t"].astype("int64")
-        frame = frame.drop_duplicates("t").set_index("t").sort_index()
+
+        frame = (
+            frame
+            .drop_duplicates("t")
+            .set_index("t")
+            .sort_index()
+        )
 
         return frame.loc[
             frame.index + seconds <= boundary
@@ -324,13 +386,16 @@ def exchange_name(code):
 # ============================================================
 
 def find_spot_market(client, coin, tf):
-    """Повторно ищет Spot-рынок с достаточной историей для конкретного TF."""
+    """Повторно ищет Spot-рынок с достаточной историей для TF."""
 
     spots = client.get("spot-markets")
 
     now = int(time.time())
     seconds = TIMEFRAMES[tf][0]
-    boundary = ((now - CLOSE_DELAY) // seconds) * seconds
+
+    boundary = (
+        (now - CLOSE_DELAY) // seconds
+    ) * seconds
 
     candidates = []
 
@@ -417,24 +482,25 @@ def find_spot_market(client, coin, tf):
 def build_market_map(client):
     spots = client.get("spot-markets")
     futures = client.get("future-markets")
-    mapping = {}
 
-    # Проверяем глубину Spot-истории отдельно для каждого TF.
+    mapping = {}
     now = int(time.time())
 
     probe_boundaries = {
-        tf: ((now - CLOSE_DELAY) // spec[0]) * spec[0]
+        tf: (
+            (now - CLOSE_DELAY) // spec[0]
+        ) * spec[0]
         for tf, spec in TIMEFRAMES.items()
     }
 
     for coin in WATCHLIST:
         perps = [
-            m for m in futures
-            if _is_required_exchange(m.get("exchange"))
-            and m.get("base_asset") == coin
-            and m.get("quote_asset") == "USDT"
-            and bool(m.get("is_perpetual"))
-            and bool(m.get("has_ohlcv_data"))
+            market for market in futures
+            if _is_required_exchange(market.get("exchange"))
+            and market.get("base_asset") == coin
+            and market.get("quote_asset") == "USDT"
+            and bool(market.get("is_perpetual"))
+            and bool(market.get("has_ohlcv_data"))
         ]
 
         if not perps:
@@ -445,9 +511,11 @@ def build_market_map(client):
             continue
 
         perps.sort(
-            key=lambda m: (
-                not bool(m.get("has_long_short_ratio_data")),
-                m["symbol"]
+            key=lambda market: (
+                not bool(
+                    market.get("has_long_short_ratio_data")
+                ),
+                market["symbol"]
             )
         )
 
@@ -460,19 +528,19 @@ def build_market_map(client):
 
             for ex_code in SPOT_FALLBACK_EXCHANGES:
                 exchange_candidates = [
-                    m for m in spots
-                    if str(m.get("exchange", "")).strip() == ex_code
-                    and m.get("base_asset") == coin
-                    and m.get("quote_asset") == "USDT"
+                    market for market in spots
+                    if str(market.get("exchange", "")).strip() == ex_code
+                    and market.get("base_asset") == coin
+                    and market.get("quote_asset") == "USDT"
                     and "USDT" in str(
-                        m.get("symbol", "")
+                        market.get("symbol", "")
                     ).upper()
                 ]
 
                 candidates_for_coin.extend(
                     sorted(
                         exchange_candidates,
-                        key=lambda m: m["symbol"]
+                        key=lambda market: market["symbol"]
                     )
                 )
 
@@ -529,7 +597,8 @@ def build_market_map(client):
 
             if selected is None:
                 logger.warning(
-                    "SPOT UNAVAILABLE | %s %s | нет Spot-рынка с историей >= %d баров (лучшая выборка=%d)",
+                    "SPOT UNAVAILABLE | %s %s | нет Spot-рынка "
+                    "с историей >= %d баров (лучшая выборка=%d)",
                     coin,
                     tf,
                     REQUIRED_BARS,
@@ -590,7 +659,9 @@ def add_indicators(frame):
         2 * frame["spot_buy_volume"] - frame["spot_volume"]
     )
 
-    frame["perp_delta"] = 2 * frame["bv"] - frame["v"]
+    frame["perp_delta"] = (
+        2 * frame["bv"] - frame["v"]
+    )
 
     frame["spot_cvd"] = frame["spot_delta"].cumsum()
     frame["perp_cvd"] = frame["perp_delta"].cumsum()
@@ -637,7 +708,10 @@ def rolling_pct(series, window):
         window,
         min_periods=min_periods
     ).apply(
-        lambda x: float((x <= x[-1]).mean()) if len(x) > 0 else 0.5,
+        lambda x: (
+            float((x <= x[-1]).mean())
+            if len(x) > 0 else 0.5
+        ),
         raw=True
     )
 
@@ -728,7 +802,8 @@ def detect_divergence(
 
 
 def analyze_orderflow(frame):
-    current, previous = frame.iloc[-1], frame.iloc[-2]
+    current = frame.iloc[-1]
+    previous = frame.iloc[-2]
 
     atr = float(frame["atr"].iloc[-2])
 
@@ -752,13 +827,22 @@ def analyze_orderflow(frame):
     ):
         return [], "Мало объёма"
 
-    high_volume = current["v"] > average_volume * VOLUME_MULTIPLIER
+    high_volume = (
+        current["v"] > average_volume * VOLUME_MULTIPLIER
+    )
 
     prior_low = frame["l"].iloc[-21:-1].min()
     prior_high = frame["h"].iloc[-21:-1].max()
 
-    swept_low = current["l"] < prior_low and current["c"] > prior_low
-    swept_high = current["h"] > prior_high and current["c"] < prior_high
+    swept_low = (
+        current["l"] < prior_low
+        and current["c"] > prior_low
+    )
+
+    swept_high = (
+        current["h"] > prior_high
+        and current["c"] < prior_high
+    )
 
     bullish_fvg = current["l"] > frame["h"].iloc[-3]
     bearish_fvg = current["h"] < frame["l"].iloc[-3]
@@ -821,7 +905,8 @@ def analyze_orderflow(frame):
         ).iloc[-1]
     )
 
-    candidates, rejected = [], []
+    candidates = []
+    rejected = []
 
     for direction in ["LONG", "SHORT"]:
         is_long = direction == "LONG"
@@ -842,7 +927,9 @@ def analyze_orderflow(frame):
                 and current["c"] > previous["c"]
             )
 
-            breakout = current["c"] > prior_high + 0.1 * atr
+            breakout = (
+                current["c"] > prior_high + 0.1 * atr
+            )
 
         else:
             recovery = (
@@ -850,7 +937,9 @@ def analyze_orderflow(frame):
                 and current["c"] < previous["c"]
             )
 
-            breakout = current["c"] < prior_low - 0.1 * atr
+            breakout = (
+                current["c"] < prior_low - 0.1 * atr
+            )
 
         reversal = bool(
             recovery
@@ -890,6 +979,7 @@ def analyze_orderflow(frame):
         setup = "Разворот" if reversal else "Пробой"
 
         score = 4
+
         reasons = [
             "Spot: дельта",
             ("Разворот" if reversal else "Пробой")
@@ -925,7 +1015,9 @@ def analyze_orderflow(frame):
             reasons.append("L/S")
 
         if score < MIN_SCORE:
-            rejected.append(f"{direction}: score={score}")
+            rejected.append(
+                f"{direction}: score={score}"
+            )
             continue
 
         candidates.append({
@@ -938,17 +1030,177 @@ def analyze_orderflow(frame):
             "oi_change": float(oi_change),
             "funding": funding,
             "funding_pct": funding_pct,
-            "spot_delta_pct": float(current["spot_share"] * 100),
-            "perp_delta_pct": float(current["perp_share"] * 100),
+            "spot_delta_pct": float(
+                current["spot_share"] * 100
+            ),
+            "perp_delta_pct": float(
+                current["perp_share"] * 100
+            ),
             "long_liq": 0.0,
             "short_liq": 0.0,
             "ls_ratio": ratio,
             "fvg": bool(
                 bullish_fvg if is_long else bearish_fvg
-            ),
+            )
         })
 
     return candidates, "; ".join(rejected)
+
+
+# ============================================================
+# РЫНОЧНЫЙ КОНТЕКСТ — ВАРИАНТ Б
+# ============================================================
+
+def build_market_context(cache, active_watchlist, tf, boundaries):
+    """
+    Считает ширину рынка по уже загруженным данным.
+    Не делает дополнительных запросов к Coinalyze.
+    Не влияет на допуск или блокировку торгового сигнала.
+    """
+
+    bullish = []
+    bearish = []
+    neutral = []
+
+    target_boundary = boundaries[tf]
+
+    for coin in active_watchlist:
+        rec = cache.get((coin, tf))
+
+        if not rec:
+            continue
+
+        if rec.get("boundary") != target_boundary:
+            continue
+
+        frame = rec.get("frame")
+
+        if frame is None or len(frame) < 3:
+            continue
+
+        try:
+            context = get_context(frame)
+        except Exception as exc:
+            logger.warning(
+                "MARKET CONTEXT ERROR | %s %s | %s",
+                coin,
+                tf,
+                exc
+            )
+            continue
+
+        if context == "bullish":
+            bullish.append(coin)
+        elif context == "bearish":
+            bearish.append(coin)
+        else:
+            neutral.append(coin)
+
+    total = len(bullish) + len(bearish) + len(neutral)
+
+    if total == 0:
+        breadth_label = "Недостаточно данных"
+        strength = "не определена"
+
+    else:
+        bullish_share = len(bullish) / total
+        bearish_share = len(bearish) / total
+
+        if (
+            bullish_share >= 0.50
+            and len(bullish) > len(bearish)
+        ):
+            breadth_label = "Bullish"
+
+            strength = (
+                "сильное"
+                if bullish_share >= 0.67
+                else "умеренное"
+            )
+
+        elif (
+            bearish_share >= 0.50
+            and len(bearish) > len(bullish)
+        ):
+            breadth_label = "Bearish"
+
+            strength = (
+                "сильное"
+                if bearish_share >= 0.67
+                else "умеренное"
+            )
+
+        else:
+            breadth_label = "Mixed / Neutral"
+            strength = "смешанное"
+
+    # Отдельно проверяем BTC на 4H — основной рыночный ориентир.
+    btc_context = "нет данных"
+
+    btc_rec = cache.get(("BTC", "4h"))
+
+    if (
+        btc_rec
+        and btc_rec.get("boundary") == boundaries.get("4h")
+        and btc_rec.get("frame") is not None
+        and len(btc_rec["frame"]) >= 3
+    ):
+        try:
+            btc_value = get_context(btc_rec["frame"])
+
+            btc_context = {
+                "bullish": "Bullish",
+                "bearish": "Bearish",
+                "neutral": "Neutral"
+            }.get(btc_value, "нет данных")
+
+        except Exception:
+            btc_context = "нет данных"
+
+    return {
+        "timeframe": tf,
+        "label": breadth_label,
+        "strength": strength,
+        "bullish": bullish,
+        "bearish": bearish,
+        "neutral": neutral,
+        "total": total,
+        "btc_4h": btc_context
+    }
+
+
+def format_market_context(context):
+    if not context:
+        return [
+            "🌐 <b>РЫНОЧНЫЙ КОНТЕКСТ</b>",
+            "Нет достаточных данных"
+        ]
+
+    bullish = context["bullish"]
+    bearish = context["bearish"]
+    neutral = context["neutral"]
+
+    total = context["total"]
+
+    lines = [
+        "🌐 <b>РЫНОЧНЫЙ КОНТЕКСТ</b>",
+        f"Общее направление: <b>{context['label']}</b>",
+        (
+            f"Монеты ({context['timeframe'].upper()}): "
+            f"🟢 {len(bullish)} LONG / "
+            f"🔴 {len(bearish)} SHORT / "
+            f"⚪ {len(neutral)} Neutral"
+        ),
+        f"BTC 4H: <b>{context['btc_4h']}</b>",
+        f"Оценка подтверждения: {context['strength']}"
+    ]
+
+    if total:
+        lines.append(
+            f"Доступно для оценки: {total} монет"
+        )
+
+    return lines
 
 
 # ============================================================
@@ -969,7 +1221,10 @@ class StateStore:
 
     def already_sent(self, coin, tf, direction, candle):
         mode = "dry" if DRY_RUN else "live"
-        sid = f"{coin}:{tf}:{direction}:{candle}:{mode}"
+
+        sid = (
+            f"{coin}:{tf}:{direction}:{candle}:{mode}"
+        )
 
         return self.db.execute(
             "SELECT 1 FROM of_signals WHERE id=?",
@@ -978,11 +1233,21 @@ class StateStore:
 
     def mark_sent(self, coin, tf, direction, candle):
         mode = "dry" if DRY_RUN else "live"
-        sid = f"{coin}:{tf}:{direction}:{candle}:{mode}"
+
+        sid = (
+            f"{coin}:{tf}:{direction}:{candle}:{mode}"
+        )
 
         self.db.execute(
             "INSERT OR IGNORE INTO of_signals VALUES (?, ?, ?, ?, ?, ?)",
-            (sid, coin, tf, direction, int(candle), mode)
+            (
+                sid,
+                coin,
+                tf,
+                direction,
+                int(candle),
+                mode
+            )
         )
 
         self.db.commit()
@@ -992,18 +1257,27 @@ class StateStore:
 # ЗАГРУЗКА РЫНОЧНЫХ ДАННЫХ
 # ============================================================
 
-def load_market_data(client, market, tf, boundary, coin="?"):
-    spot_market = market.get("spot_by_tf", {}).get(tf)
+def load_market_data(
+    client,
+    market,
+    tf,
+    boundary,
+    coin="?"
+):
+    spot_market = market.get(
+        "spot_by_tf",
+        {}
+    ).get(tf)
 
     if spot_market is None:
         raise DataError(
-            f"для {coin} {tf} нет Spot-рынка с историей >= {REQUIRED_BARS} баров"
+            f"для {coin} {tf} нет Spot-рынка "
+            f"с историей >= {REQUIRED_BARS} баров"
         )
 
     perp_sym = market["perp"]["symbol"]
     spot_sym = spot_market["symbol"]
 
-    # Получаем источники отдельно и сразу записываем размер каждой выборки.
     perp = client.history(
         "ohlcv-history",
         perp_sym,
@@ -1077,14 +1351,18 @@ def load_market_data(client, market, tf, boundary, coin="?"):
     count_after_spot = len(frame)
 
     frame = frame.join(
-        oi.rename(columns={"c": "oi"}),
+        oi.rename(
+            columns={"c": "oi"}
+        ),
         how="inner"
     )
 
     count_after_oi = len(frame)
 
     frame = frame.join(
-        funding.rename(columns={"c": "funding"}),
+        funding.rename(
+            columns={"c": "funding"}
+        ),
         how="inner"
     )
 
@@ -1102,13 +1380,17 @@ def load_market_data(client, market, tf, boundary, coin="?"):
         len(frame)
     )
 
-    frame["long_liq"], frame["short_liq"] = 0.0, 0.0
+    # Пока реальные исторические ликвидации и L/S Ratio
+    # не подключены. Не выдаём нули за реальные данные.
+    frame["long_liq"] = np.nan
+    frame["short_liq"] = np.nan
     frame["ls_ratio"] = np.nan
 
     if len(frame) < REQUIRED_BARS:
         raise DataError(
             f"Мало баров после inner join: {len(frame)} < {REQUIRED_BARS} "
-            f"(Perp={len(perp)}, Spot={len(spot)}, OI={len(oi)}, Funding={len(funding)})"
+            f"(Perp={len(perp)}, Spot={len(spot)}, "
+            f"OI={len(oi)}, Funding={len(funding)})"
         )
 
     return add_indicators(frame)
@@ -1120,12 +1402,18 @@ def load_market_data(client, market, tf, boundary, coin="?"):
 
 def send_telegram(text):
     if DRY_RUN:
-        logger.info("DRY_RUN: %s", text)
+        logger.info(
+            "DRY_RUN: %s",
+            text
+        )
         return True
 
     try:
         res = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            (
+                "https://api.telegram.org/"
+                f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            ),
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": text,
@@ -1134,13 +1422,32 @@ def send_telegram(text):
             timeout=20
         )
 
-        return res.status_code == 200
+        if res.status_code != 200:
+            logger.warning(
+                "Telegram error | HTTP %s | %s",
+                res.status_code,
+                res.text[:500]
+            )
+            return False
 
-    except Exception:
+        return True
+
+    except Exception as exc:
+        logger.warning(
+            "Telegram send failed: %s",
+            exc
+        )
         return False
 
 
-def format_signal(coin, tf, candle, signal, detected_at):
+def format_signal(
+    coin,
+    tf,
+    candle,
+    signal,
+    detected_at,
+    market_context=None
+):
     signal_time = candle + TIMEFRAMES[tf][0]
 
     age_seconds = max(
@@ -1148,15 +1455,17 @@ def format_signal(coin, tf, candle, signal, detected_at):
         int(detected_at) - signal_time
     )
 
+    # Конвертируем только отображение времени.
+    # Unix timestamp и внутренние расчёты остаются UTC.
     signal_time_text = datetime.fromtimestamp(
         signal_time,
-        timezone.utc
-    ).strftime("%Y-%m-%d %H:%M UTC")
+        LOCAL_TIMEZONE
+    ).strftime("%Y-%m-%d %H:%M")
 
     detected_text = datetime.fromtimestamp(
         detected_at,
-        timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+        LOCAL_TIMEZONE
+    ).strftime("%Y-%m-%d %H:%M:%S")
 
     age_minutes = age_seconds // 60
 
@@ -1166,13 +1475,22 @@ def format_signal(coin, tf, candle, signal, detected_at):
         else "🔴"
     )
 
-    return NL.join([
-        f"{emoji} <b>ORDER FLOW | {tf.upper()} {signal['direction']}</b>",
+    lines = [
+        (
+            f"{emoji} <b>ORDER FLOW | "
+            f"{tf.upper()} {signal['direction']}</b>"
+        ),
         "",
-        f"Монета: <b>#{coin}USDT</b>",
+        f"Монета: <b>#{html.escape(coin)}USDT</b>",
         f"Цена сигнала: <b>{signal['price']:,.4f}</b>",
-        f"Время сигнала (закрытие свечи): {signal_time_text}",
-        f"Бот обнаружил/отправляет: {detected_text}",
+        (
+            f"Время сигнала (закрытие свечи): "
+            f"<b>{signal_time_text} Хабаровск</b>"
+        ),
+        (
+            f"Бот обнаружил/отправляет: "
+            f"<b>{detected_text} Хабаровск</b>"
+        ),
         f"Возраст сигнала: {age_minutes} мин.",
         f"Сетап: {signal['setup']}",
         f"Баллы: {signal['score']}/10",
@@ -1180,8 +1498,23 @@ def format_signal(coin, tf, candle, signal, detected_at):
         f"📊 Spot: {signal['spot_delta_pct']:+.1f}%",
         f"📊 Perp: {signal['perp_delta_pct']:+.1f}%",
         f"🏦 OI: {signal['oi_change']:+.2f}%",
-        f"💰 Funding: {signal['funding']:+.4f}%"
+        f"💰 Funding: {signal['funding']:+.4f}%",
+        ""
+    ]
+
+    lines.extend(
+        format_market_context(market_context)
+    )
+
+    lines.extend([
+        "",
+        (
+            "ℹ️ Рыночный контекст — дополнительная информация, "
+            "не гарантия движения цены."
+        )
     ])
+
+    return NL.join(lines)
 
 
 # ============================================================
@@ -1204,25 +1537,22 @@ def main():
 
     cache = {}
     processed = set()
-
     retry_after = {}
 
-    # Время следующей повторной проверки отсутствующего Spot.
-    # Ключ: (coin, timeframe).
     spot_retry_after = {}
 
-    # В текущей загрузке L/S Ratio не запрашивается,
-    # поэтому фактически доступны 8 баллов.
     logger.info(
         "CONFIG | REQUESTED_WATCHLIST=%s | TIMEFRAMES=%s | "
         "MIN_SCORE=%d | REQUIRED_BARS=%d | "
-        "MAX_SIGNAL_DELAY_1H=%d sec | MAX_SIGNAL_DELAY_4H=%d sec | DRY_RUN=%s",
+        "MAX_SIGNAL_DELAY_1H=%d sec | MAX_SIGNAL_DELAY_4H=%d sec | "
+        "TIMEZONE=%s | DRY_RUN=%s",
         ",".join(WATCHLIST),
         ",".join(LOAD_ORDER),
         MIN_SCORE,
         REQUIRED_BARS,
         MAX_SIGNAL_DELAY_BY_TF["1h"],
         MAX_SIGNAL_DELAY_BY_TF["4h"],
+        TIMEZONE_NAME,
         DRY_RUN
     )
 
@@ -1235,8 +1565,10 @@ def main():
         )
 
     send_telegram(
-        f"🚀 <b>Order Flow (Упрощенный) запущен</b>\n"
+        f"🚀 <b>Order Flow запущен</b>\n"
         f"Монеты: {', '.join(WATCHLIST)}\n"
+        f"Таймфреймы: 1H / 4H\n"
+        f"Время уведомлений: {TIMEZONE_NAME}\n"
         f"Режим: {'DRY RUN' if DRY_RUN else 'LIVE'}"
     )
 
@@ -1267,7 +1599,9 @@ def main():
         now = int(time.time())
 
         boundaries = {
-            tf: ((now - CLOSE_DELAY) // spec[0]) * spec[0]
+            tf: (
+                (now - CLOSE_DELAY) // spec[0]
+            ) * spec[0]
             for tf, spec in TIMEFRAMES.items()
         }
 
@@ -1278,20 +1612,19 @@ def main():
         for tf in LOAD_ORDER:
             for coin in active_watchlist:
 
-                # Если Spot для этого TF отсутствует,
-                # периодически пробуем найти подходящий рынок.
-                if market_map[coin].get("spot_by_tf", {}).get(tf) is None:
-
+                if (
+                    market_map[coin]
+                    .get("spot_by_tf", {})
+                    .get(tf) is None
+                ):
                     spot_retry_key = (coin, tf)
+
                     next_check = spot_retry_after.get(
                         spot_retry_key,
                         0
                     )
 
                     if now >= next_check:
-
-                        # Сразу назначаем следующую проверку,
-                        # чтобы ошибки API не вызывали частые запросы.
                         spot_retry_after[spot_retry_key] = (
                             now + SPOT_RECHECK_SECONDS
                         )
@@ -1304,7 +1637,9 @@ def main():
                             )
 
                             if recovered is not None:
-                                market_map[coin]["spot_by_tf"][tf] = recovered
+                                market_map[coin]["spot_by_tf"][tf] = (
+                                    recovered
+                                )
 
                                 spot_retry_after.pop(
                                     spot_retry_key,
@@ -1326,9 +1661,11 @@ def main():
                                 exc
                             )
 
-                    # Если рынок всё ещё не найден,
-                    # пропускаем загрузку этого TF.
-                    if market_map[coin].get("spot_by_tf", {}).get(tf) is None:
+                    if (
+                        market_map[coin]
+                        .get("spot_by_tf", {})
+                        .get(tf) is None
+                    ):
                         continue
 
                 key = (coin, tf)
@@ -1341,7 +1678,11 @@ def main():
                     continue
 
                 retry_key = (coin, tf, boundary)
-                retry_time = retry_after.get(retry_key, 0)
+
+                retry_time = retry_after.get(
+                    retry_key,
+                    0
+                )
 
                 if now < retry_time:
                     continue
@@ -1374,8 +1715,6 @@ def main():
                     )
 
                 except Exception as exc:
-                    # Если не хватает свечей после inner join,
-                    # ждём закрытия следующей свечи этого TF.
                     error_text = str(exc)
 
                     if "Мало баров после inner join" in error_text:
@@ -1406,7 +1745,8 @@ def main():
                         ) % DATA_RETRY_SECONDS
 
                     HEALTH["last_error"] = (
-                        f"{coin} {tf}: {type(exc).__name__}: {exc}"
+                        f"{coin} {tf}: "
+                        f"{type(exc).__name__}: {exc}"
                     )
 
                     HEALTH["status"] = "degraded"
@@ -1420,18 +1760,53 @@ def main():
                     )
 
         # ----------------------------------------------------
+        # РАСЧЁТ РЫНОЧНОГО КОНТЕКСТА
+        # ----------------------------------------------------
+
+        market_contexts = {}
+
+        for tf in LOAD_ORDER:
+            market_contexts[tf] = build_market_context(
+                cache,
+                active_watchlist,
+                tf,
+                boundaries
+            )
+
+            context = market_contexts[tf]
+
+            logger.info(
+                "MARKET CONTEXT | %s | label=%s | "
+                "bullish=%d bearish=%d neutral=%d total=%d | BTC_4H=%s",
+                tf,
+                context["label"],
+                len(context["bullish"]),
+                len(context["bearish"]),
+                len(context["neutral"]),
+                context["total"],
+                context["btc_4h"]
+            )
+
+        # ----------------------------------------------------
         # АНАЛИЗ СИГНАЛОВ
         # ----------------------------------------------------
 
         for tf in LOAD_ORDER:
             for coin in active_watchlist:
 
-                if market_map[coin].get("spot_by_tf", {}).get(tf) is None:
+                if (
+                    market_map[coin]
+                    .get("spot_by_tf", {})
+                    .get(tf) is None
+                ):
                     continue
 
                 rec = cache.get((coin, tf))
 
-                if not rec or rec["boundary"] != boundaries[tf]:
+                if (
+                    not rec
+                    or rec["boundary"] != boundaries[tf]
+                ):
                     continue
 
                 frame = rec["frame"]
@@ -1442,14 +1817,20 @@ def main():
                 if work_key in processed:
                     continue
 
-                # Не отправляем исторические сигналы при старте
-                # или после задержки API.
-                candle_close_time = candle + TIMEFRAMES[tf][0]
+                candle_close_time = (
+                    candle + TIMEFRAMES[tf][0]
+                )
+
                 max_signal_age = MAX_SIGNAL_DELAY_BY_TF[tf]
 
-                signal_age = int(time.time()) - candle_close_time
+                signal_age = (
+                    int(time.time()) - candle_close_time
+                )
 
-                if signal_age < 0 or signal_age > max_signal_age:
+                if (
+                    signal_age < 0
+                    or signal_age > max_signal_age
+                ):
                     logger.info(
                         "SIGNAL SKIP STALE | %s %s | age=%d sec | "
                         "max=%d sec | candle_close=%s",
@@ -1459,14 +1840,16 @@ def main():
                         max_signal_age,
                         datetime.fromtimestamp(
                             candle_close_time,
-                            timezone.utc
-                        ).strftime("%Y-%m-%d %H:%M:%S UTC")
+                            LOCAL_TIMEZONE
+                        ).strftime("%Y-%m-%d %H:%M:%S %Z")
                     )
 
                     processed.add(work_key)
                     continue
 
-                candidates, explanation = analyze_orderflow(frame)
+                candidates, explanation = analyze_orderflow(
+                    frame
+                )
 
                 if not candidates:
                     logger.info(
@@ -1490,14 +1873,17 @@ def main():
                     processed.add(work_key)
                     continue
 
-                # Повторная проверка непосредственно перед отправкой:
-                # анализ/очередь могли занять время, и сигнал мог выйти
-                # за возрастной лимит TF.
+                # Повторная проверка непосредственно перед отправкой.
                 detected_at = int(time.time())
 
-                signal_age = detected_at - candle_close_time
+                signal_age = (
+                    detected_at - candle_close_time
+                )
 
-                if signal_age < 0 or signal_age > max_signal_age:
+                if (
+                    signal_age < 0
+                    or signal_age > max_signal_age
+                ):
                     logger.info(
                         "SIGNAL SKIP STALE BEFORE SEND | %s %s | "
                         "age=%d sec | max=%d sec",
@@ -1515,7 +1901,8 @@ def main():
                     tf,
                     candle,
                     signal,
-                    detected_at
+                    detected_at,
+                    market_contexts.get(tf)
                 )
 
                 if send_telegram(message):
@@ -1527,11 +1914,17 @@ def main():
                     )
 
                     logger.info(
-                        "SIGNAL: %s %s %s | age=%d sec",
+                        "SIGNAL: %s %s %s | age=%d sec | "
+                        "market=%s | timezone=%s",
                         coin,
                         tf,
                         signal["direction"],
-                        signal_age
+                        signal_age,
+                        market_contexts.get(
+                            tf,
+                            {}
+                        ).get("label", "unknown"),
+                        TIMEZONE_NAME
                     )
 
                     processed.add(work_key)
