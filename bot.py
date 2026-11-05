@@ -14,2091 +14,431 @@ import numpy as np
 import pandas as pd
 import requests
 
-
 # ============================================================
-# НАСТРОЙКИ
+# НАСТРОЙКИ (ФИНАЛЬНАЯ ВЕРСИЯ: 1H + 4H, БЕЗ EMA200)
 # ============================================================
 
 API_BASE = "https://api.coinalyze.net/v1"
 COINALYZE_API_KEY = os.getenv("COINALYZE_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() == "true"
 
-DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() == "true"
-
-TIMEZONE_NAME = os.getenv(
-    "TIMEZONE",
-    "Asia/Vladivostok"
-).strip()
-
+TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Moscow").strip()
 try:
     LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_NAME)
 except (ZoneInfoNotFoundError, ValueError):
-    print(
-        f"Неизвестный TIMEZONE={TIMEZONE_NAME}; "
-        "используется Asia/Vladivostok"
-    )
-    TIMEZONE_NAME = "Asia/Vladivostok"
-    LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_NAME)
+    LOCAL_TIMEZONE = ZoneInfo("UTC")
 
-
-coins = [
-    value.strip().upper()
-    for value in os.getenv(
-        "WATCHLIST",
-        "BTC,SOL,XRP,BNB,DOGE,LINK"
-    ).split(",")
-    if value.strip()
-]
-
+coins = [value.strip().upper() for value in os.getenv("WATCHLIST", "BTC").split(",") if value.strip()]
 WATCHLIST = list(dict.fromkeys(["BTC"] + coins))
 
+# ТОЛЬКО 1H И 4H (как мы и договорились)
 TIMEFRAMES = {
     "1h": (3600, "1hour"),
     "4h": (14400, "4hour"),
 }
 
 LOAD_ORDER = ["4h", "1h"]
+LOOKBACK_BARS = 150 
+REQUIRED_BARS = 100
 
-LOOKBACK_BARS = 100
-REQUIRED_BARS = 65
+CLOSE_DELAY = int(os.getenv("CLOSE_DELAY_SECONDS", "45"))
+MAX_SIGNAL_DELAY_BY_TF = {"1h": 3600, "4h": 14400}
 
-CLOSE_DELAY = int(
-    os.getenv("CLOSE_DELAY_SECONDS", "45")
-)
-
-MAX_SIGNAL_DELAY_BY_TF = {
-    "1h": int(os.getenv("MAX_SIGNAL_DELAY_1H_SECONDS", "3600")),
-    "4h": int(os.getenv("MAX_SIGNAL_DELAY_4H_SECONDS", "14400")),
-}
-
-MIN_SCORE = int(os.getenv("MIN_SCORE", "10"))
+# Порог баллов (максимум теперь 10)
+MIN_SCORE = int(os.getenv("MIN_SCORE", "7")) 
 COOLDOWN_BARS = int(os.getenv("COOLDOWN_BARS", "2"))
 
-MIN_DELTA_SHARE = float(os.getenv("MIN_DELTA_SHARE", "0.03"))
-OI_THRESHOLD = float(os.getenv("OI_CHANGE_PERCENT", "0.30"))
+MIN_DELTA_SHARE = float(os.getenv("MIN_DELTA_SHARE", "0.08"))
+OI_THRESHOLD = float(os.getenv("OI_CHANGE_PERCENT", "0.20"))
 VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", "1.50"))
-FUNDING_LIMIT = float(os.getenv("FUNDING_LIMIT_PERCENT", "0.05"))
+FUNDING_LIMIT = float(os.getenv("FUNDING_LIMIT_PERCENT", "0.04"))
 FUNDING_PCT_LIMIT = float(os.getenv("FUNDING_PCT_LIMIT", "0.90"))
-FUNDING_WINDOW = int(os.getenv("FUNDING_WINDOW_BARS", "96"))
-
-MIN_LIQ_USD = float(os.getenv("MIN_LIQUIDATION_USD", "10000"))
-LIQ_MULTIPLIER = float(os.getenv("LIQUIDATION_SPIKE_MULTIPLIER", "3.0"))
 
 DATA_RETRY_SECONDS = 120
-TELEGRAM_RETRY_SECONDS = 60
 SPOT_RECHECK_SECONDS = 900
-
-STATE_DB = os.getenv("STATE_DB", "bot_state.sqlite3")
-
-REQUIRED_EXCHANGE = "A"
-SPOT_FALLBACK_EXCHANGES = ["A", "O", "B", "C"]
-
+STATE_DB = "bot_state.sqlite3"
 NL = chr(10)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("orderflow")
-
-HEALTH = {
-    "status": "starting",
-    "last_cycle": None,
-    "last_data_success": None,
-    "last_error": None
-}
-
+HEALTH = {"status": "starting", "last_cycle": None, "last_error": None}
 
 # ============================================================
-# HEALTH-СЕРВЕР И ПИНГЕР
+# ИНФРАСТРУКТУРА (ОТ ДРУГОЙ НЕЙРОСЕТИ - ХОРОШАЯ)
 # ============================================================
-
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = json.dumps(
-            HEALTH,
-            ensure_ascii=False
-        ).encode("utf-8")
-
+        body = json.dumps(HEALTH, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
-        self.send_header(
-            "Content-Type",
-            "application/json; charset=utf-8"
-        )
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.end_headers()
         self.wfile.write(body)
-
-    def log_message(self, *args):
-        pass
-
+    def log_message(self, *args): pass
 
 def start_health_server():
     port = int(os.getenv("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-
-    logger.info("Health server: port %s", port)
-    server.serve_forever()
-
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 def self_ping_worker():
-    url = os.getenv(
-        "RENDER_EXTERNAL_URL",
-        "https://fitstbot.onrender.com/"
-    )
-
-    if not url.endswith("/"):
-        url += "/"
-
+    url = os.getenv("RENDER_EXTERNAL_URL", "")
+    if not url: return
     while True:
-        try:
-            res = requests.get(url, timeout=10)
-            logger.info(
-                "Self-ping OK | HTTP %s",
-                res.status_code
-            )
-        except Exception as exc:
-            logger.warning(
-                "Self-ping failed: %s",
-                type(exc).__name__
-            )
-
+        try: requests.get(url, timeout=10)
+        except Exception: pass
         time.sleep(600)
 
-
-# ============================================================
-# COINALYZE CLIENT
-# ============================================================
-
-class DataError(Exception):
-    pass
-
-
-class AuthenticationError(Exception):
-    pass
-
+class DataError(Exception): pass
+class AuthenticationError(Exception): pass
 
 class CoinalyzeClient:
-    MAX_CALLS_PER_WINDOW = 30
-    WINDOW_SECONDS = 61.0
-    MIN_REQUEST_GAP = 2.1
-
     def __init__(self):
         self.session = requests.Session()
-
-        self.session.headers.update({
-            "api_key": COINALYZE_API_KEY,
-            "Accept": "application/json"
-        })
-
+        self.session.headers.update({"api_key": COINALYZE_API_KEY, "Accept": "application/json"})
         self.calls = deque()
         self.last_call = 0.0
-        self.total_calls = 0
         self.rate_lock = threading.Lock()
 
     def wait_for_slot(self):
         with self.rate_lock:
             while True:
                 now = time.monotonic()
-
-                while (
-                    self.calls
-                    and now - self.calls[0] >= self.WINDOW_SECONDS
-                ):
+                while self.calls and now - self.calls[0] >= 61.0:
                     self.calls.popleft()
-
-                delay = max(
-                    0.0,
-                    self.last_call + self.MIN_REQUEST_GAP - now
-                )
-
-                if len(self.calls) >= self.MAX_CALLS_PER_WINDOW:
-                    delay = max(
-                        delay,
-                        self.calls[0] + self.WINDOW_SECONDS - now
-                    )
-
+                delay = max(0.0, self.last_call + 2.1 - now)
+                if len(self.calls) >= 30:
+                    delay = max(delay, self.calls[0] + 61.0 - now)
                 if delay <= 0:
-                    self.calls.append(now)
-                    self.last_call = now
-                    self.total_calls += 1
-                    return
-
+                    self.calls.append(now); self.last_call = now; return
                 time.sleep(delay + 0.05)
 
     def get(self, endpoint, params=None):
         params = dict(params or {})
-
         for attempt in range(4):
             self.wait_for_slot()
-
             try:
-                response = self.session.get(
-                    f"{API_BASE}/{endpoint}",
-                    params=params,
-                    timeout=25
-                )
-
+                res = self.session.get(f"{API_BASE}/{endpoint}", params=params, timeout=25)
             except requests.RequestException:
-                time.sleep(2 ** attempt)
-                continue
+                time.sleep(2 ** attempt); continue
+            if res.status_code == 401: raise AuthenticationError("API Key Error")
+            if res.status_code == 429: time.sleep(60); continue
+            if res.status_code != 200: raise DataError(f"{endpoint}: HTTP {res.status_code}")
+            return res.json()
+        raise DataError(f"{endpoint}: failed")
 
-            if response.status_code == 401:
-                raise AuthenticationError(
-                    "Проверьте COINALYZE_API_KEY"
-                )
-
-            if response.status_code == 429:
-                try:
-                    delay = float(
-                        response.headers.get("Retry-After", "60")
-                    )
-                except (TypeError, ValueError):
-                    delay = 60
-
-                logger.warning(
-                    "Coinalyze 429 | Сплю %.1f секунд",
-                    delay
-                )
-
-                time.sleep(max(1, delay))
-                continue
-
-            if response.status_code >= 500:
-                time.sleep(2 ** attempt)
-                continue
-
-            if response.status_code != 200:
-                raise DataError(
-                    f"{endpoint}: HTTP {response.status_code}"
-                )
-
-            try:
-                result = response.json()
-            except ValueError:
-                time.sleep(2 ** attempt)
-                continue
-
-            if not isinstance(result, list):
-                raise DataError(
-                    f"{endpoint}: ожидался JSON-массив"
-                )
-
-            return result
-
-        raise DataError(
-            f"{endpoint}: исчерпаны попытки"
-        )
-
-    def history(
-        self,
-        endpoint,
-        symbol,
-        tf,
-        boundary,
-        columns,
-        usd=False
-    ):
+    def history(self, endpoint, symbol, tf, boundary, columns, usd=False):
         seconds, interval = TIMEFRAMES[tf]
-
-        params = {
-            "symbols": symbol,
-            "interval": interval,
-            "from": boundary - LOOKBACK_BARS * seconds,
-            "to": boundary - 1
-        }
-
-        if usd:
-            params["convert_to_usd"] = "true"
-
+        params = {"symbols": symbol, "interval": interval, "from": boundary - LOOKBACK_BARS * seconds, "to": boundary - 1}
+        if usd: params["convert_to_usd"] = "true"
+        
         result = self.get(endpoint, params)
-
-        entry = next(
-            (
-                item for item in result
-                if item.get("symbol") == symbol
-            ),
-            None
-        )
-
-        if entry is None or not entry.get("history"):
-            raise DataError(
-                f"{endpoint}: нет истории {symbol}"
-            )
-
-        frame = pd.DataFrame(entry["history"])
-        required = ["t"] + columns
-
-        if not set(required).issubset(frame.columns):
-            raise DataError(
-                f"{endpoint}: нет полей {required}"
-            )
-
-        frame = frame[required].copy()
-
-        for column in required:
-            frame[column] = pd.to_numeric(
-                frame[column],
-                errors="coerce"
-            )
-
-        frame["t"] = frame["t"].astype("int64")
-
-        frame = (
-            frame
-            .drop_duplicates("t")
-            .set_index("t")
-            .sort_index()
-        )
-
-        return frame.loc[
-            frame.index + seconds <= boundary
-        ]
-
-    def optional_history(
-        self,
-        endpoint,
-        symbol,
-        tf,
-        boundary,
-        columns,
-        usd=False
-    ):
-        """
-        Необязательная история.
-        Если endpoint не отдаёт данные, возвращает пустой DataFrame.
-        Ошибку авторизации не скрывает.
-        """
-
-        try:
-            return self.history(
-                endpoint,
-                symbol,
-                tf,
-                boundary,
-                columns,
-                usd=usd
-            )
-
-        except AuthenticationError:
-            raise
-
-        except DataError as exc:
-            logger.warning(
-                "OPTIONAL DATA UNAVAILABLE | %s | %s | %s",
-                endpoint,
-                symbol,
-                exc
-            )
-
-        except Exception as exc:
-            logger.warning(
-                "OPTIONAL DATA ERROR | %s | %s | %s",
-                endpoint,
-                symbol,
-                exc
-            )
-
-        return pd.DataFrame(
-            columns=columns,
-            index=pd.Index([], name="t")
-        )
-
-
-def _is_required_exchange(market_exchange):
-    value = str(market_exchange or "").strip()
-
-    return (
-        value == REQUIRED_EXCHANGE
-        or (
-            REQUIRED_EXCHANGE == "A"
-            and value == "Binance"
-        )
-    )
-
-
-def exchange_name(code):
-    mapping = {
-        "A": "Binance",
-        "B": "Bybit",
-        "C": "Coinbase",
-        "O": "OKX"
-    }
-
-    return mapping.get(
-        str(code or "").strip(),
-        str(code or "?")
-    )
-
+        entry = next((item for item in result if item.get("symbol") == symbol), None)
+        if entry is None or not entry.get("history"): raise DataError(f"{endpoint}: no history {symbol}")
+        
+        frame = pd.DataFrame(entry["history"])[["t"] + columns]
+        for col in ["t"] + columns: frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        return frame.drop_duplicates("t").set_index("t").sort_index()
 
 # ============================================================
-# АВТОМАТИЧЕСКОЕ ВОССТАНОВЛЕНИЕ SPOT
+# ПОИСК РЫНКОВ
 # ============================================================
-
-def find_spot_market(client, coin, tf):
+def find_spot_market(client, coin, tf, boundary):
     spots = client.get("spot-markets")
-
-    now = int(time.time())
-    seconds = TIMEFRAMES[tf][0]
-
-    boundary = (
-        (now - CLOSE_DELAY) // seconds
-    ) * seconds
-
     candidates = []
-
-    for ex_code in SPOT_FALLBACK_EXCHANGES:
-        exchange_candidates = [
-            market for market in spots
-            if str(market.get("exchange", "")).strip() == ex_code
-            and market.get("base_asset") == coin
-            and market.get("quote_asset") == "USDT"
-            and "USDT" in str(
-                market.get("symbol", "")
-            ).upper()
-        ]
-
-        candidates.extend(
-            sorted(
-                exchange_candidates,
-                key=lambda market: market["symbol"]
-            )
-        )
-
-    best_count = -1
-
-    for candidate in candidates:
-        symbol = candidate["symbol"]
-
+    for ex in ["A", "O", "B", "C"]: # Binance, OKX, Bybit, Coinbase
+        c = [m for m in spots if m.get("exchange") == ex and m.get("base_asset") == coin and m.get("quote_asset") == "USDT"]
+        candidates.extend(sorted(c, key=lambda x: x["symbol"]))
+    for cand in candidates:
         try:
-            probe = client.history(
-                "ohlcv-history",
-                symbol,
-                tf,
-                boundary,
-                ["v", "bv"]
-            )
-
-            bars = len(probe)
-            best_count = max(best_count, bars)
-
-            if bars >= REQUIRED_BARS:
-                logger.info(
-                    "SPOT RECOVERED | %s %s | %s (%s) | bars=%d",
-                    coin,
-                    tf,
-                    symbol,
-                    exchange_name(candidate.get("exchange")),
-                    bars
-                )
-                return candidate
-
-            logger.info(
-                "SPOT RECHECK | %s %s | %s | bars=%d < %d",
-                coin,
-                tf,
-                symbol,
-                bars,
-                REQUIRED_BARS
-            )
-
-        except Exception as exc:
-            logger.warning(
-                "SPOT RECHECK ERR | %s %s | %s | %s",
-                coin,
-                tf,
-                symbol,
-                exc
-            )
-
-    logger.info(
-        "SPOT STILL UNAVAILABLE | %s %s | best=%d | next check in %d sec",
-        coin,
-        tf,
-        best_count,
-        SPOT_RECHECK_SECONDS
-    )
-
+            probe = client.history("ohlcv-history", cand["symbol"], tf, boundary, ["v", "bv"])
+            if len(probe) >= REQUIRED_BARS: return cand
+        except: pass
     return None
 
-
-# ============================================================
-# ПОИСК РЫНКОВ ПРИ ЗАПУСКЕ
-# ============================================================
-
 def build_market_map(client):
-    spots = client.get("spot-markets")
     futures = client.get("future-markets")
-
     mapping = {}
-    now = int(time.time())
-
-    probe_boundaries = {
-        tf: (
-            (now - CLOSE_DELAY) // spec[0]
-        ) * spec[0]
-        for tf, spec in TIMEFRAMES.items()
-    }
+    boundaries = {tf: (int(time.time()) - CLOSE_DELAY) // spec[0] * spec[0] for tf, spec in TIMEFRAMES.items()}
 
     for coin in WATCHLIST:
-        perps = [
-            market for market in futures
-            if _is_required_exchange(market.get("exchange"))
-            and market.get("base_asset") == coin
-            and market.get("quote_asset") == "USDT"
-            and bool(market.get("is_perpetual"))
-            and bool(market.get("has_ohlcv_data"))
-        ]
-
-        if not perps:
-            logger.warning(
-                "MARKET SKIP | %s | Perp=False | монета исключена",
-                coin
-            )
-            continue
-
-        perps.sort(
-            key=lambda market: (
-                not bool(
-                    market.get("has_long_short_ratio_data")
-                ),
-                market["symbol"]
-            )
-        )
-
+        perps = [m for m in futures if m.get("exchange") == "A" and m.get("base_asset") == coin and m.get("quote_asset") == "USDT" and m.get("is_perpetual")]
+        if not perps: continue
+        
+        perp = sorted(perps, key=lambda x: x["symbol"])[0]
         spot_by_tf = {}
-
         for tf in TIMEFRAMES:
-            selected = None
-            best_count = -1
-            candidates_for_coin = []
-
-            for ex_code in SPOT_FALLBACK_EXCHANGES:
-                exchange_candidates = [
-                    market for market in spots
-                    if str(market.get("exchange", "")).strip() == ex_code
-                    and market.get("base_asset") == coin
-                    and market.get("quote_asset") == "USDT"
-                    and "USDT" in str(
-                        market.get("symbol", "")
-                    ).upper()
-                ]
-
-                candidates_for_coin.extend(
-                    sorted(
-                        exchange_candidates,
-                        key=lambda market: market["symbol"]
-                    )
-                )
-
-            for candidate in candidates_for_coin:
-                symbol = candidate["symbol"]
-
-                try:
-                    probe = client.history(
-                        "ohlcv-history",
-                        symbol,
-                        tf,
-                        probe_boundaries[tf],
-                        ["v", "bv"]
-                    )
-
-                    bars = len(probe)
-                    best_count = max(best_count, bars)
-
-                    if bars >= REQUIRED_BARS:
-                        selected = candidate
-
-                        logger.info(
-                            "SPOT SELECT | %s %s | %s (%s) | bars=%d",
-                            coin,
-                            tf,
-                            symbol,
-                            exchange_name(candidate.get("exchange")),
-                            bars
-                        )
-                        break
-
-                    logger.warning(
-                        "SPOT REJECT | %s %s | %s (%s) | bars=%d < %d",
-                        coin,
-                        tf,
-                        symbol,
-                        exchange_name(candidate.get("exchange")),
-                        bars,
-                        REQUIRED_BARS
-                    )
-
-                except Exception as exc:
-                    logger.warning(
-                        "SPOT PROBE ERR | %s %s | %s (%s) | %s",
-                        coin,
-                        tf,
-                        symbol,
-                        exchange_name(candidate.get("exchange")),
-                        exc
-                    )
-
-            spot_by_tf[tf] = selected
-
-            if selected is None:
-                logger.warning(
-                    "SPOT UNAVAILABLE | %s %s | нет Spot-рынка "
-                    "с историей >= %d баров (лучшая выборка=%d)",
-                    coin,
-                    tf,
-                    REQUIRED_BARS,
-                    best_count
-                )
-
-        if not any(spot_by_tf.values()):
-            logger.warning(
-                "MARKET SKIP | %s | нет Spot-истории достаточной длины ни на одном TF",
-                coin
-            )
-            continue
-
-        mapping[coin] = {
-            "spot_by_tf": spot_by_tf,
-            "perp": perps[0]
-        }
-
-        selected_text = ", ".join(
-            f"{tf}={market['symbol'] if market else 'нет'}"
-            for tf, market in spot_by_tf.items()
-        )
-
-        logger.info(
-            "MARKET OK | %s | spot[%s] | perp=%s | L/S=%s",
-            coin,
-            selected_text,
-            perps[0]["symbol"],
-            bool(perps[0].get("has_long_short_ratio_data"))
-        )
-
-    if not mapping:
-        raise DataError(
-            "Не удалось найти ни одной монеты с подходящими Spot и perpetual рынками"
-        )
-
-    skipped = [
-        coin for coin in WATCHLIST
-        if coin not in mapping
-    ]
-
-    logger.info(
-        "MARKET SUMMARY | active=%s | skipped=%s",
-        ",".join(mapping),
-        ",".join(skipped) or "нет"
-    )
-
+            spot = find_spot_market(client, coin, tf, boundaries[tf])
+            if spot: spot_by_tf[tf] = spot
+            
+        if spot_by_tf:
+            mapping[coin] = {"perp": perp, "spot_by_tf": spot_by_tf}
+            logger.info(f"MARKET OK | {coin} | Perp: {perp['symbol']}")
+            
     return mapping
 
-
 # ============================================================
-# ИНДИКАТОРЫ И АНАЛИЗ
+# ЛОГИКА АНАЛИЗА (НАША, БЕЗ EMA200)
 # ============================================================
-
 def add_indicators(frame):
     frame = frame.copy()
-
-    frame["spot_delta"] = (
-        2 * frame["spot_buy_volume"] - frame["spot_volume"]
-    )
-
-    frame["perp_delta"] = (
-        2 * frame["bv"] - frame["v"]
-    )
-
+    frame["spot_delta"] = 2 * frame["spot_buy_volume"] - frame["spot_volume"]
+    frame["perp_delta"] = 2 * frame["bv"] - frame["v"]
     frame["spot_cvd"] = frame["spot_delta"].cumsum()
     frame["perp_cvd"] = frame["perp_delta"].cumsum()
-
-    frame["spot_share"] = (
-        frame["spot_delta"]
-        / frame["spot_volume"].replace(0, np.nan)
-    )
-
-    frame["perp_share"] = (
-        frame["perp_delta"]
-        / frame["v"].replace(0, np.nan)
-    )
+    frame["spot_share"] = frame["spot_delta"] / frame["spot_volume"].replace(0, np.nan)
+    frame["perp_share"] = frame["perp_delta"] / frame["v"].replace(0, np.nan)
+    
+    if "spot_close" in frame.columns:
+        frame["basis"] = (frame["c"] - frame["spot_close"]) / frame["spot_close"] * 100
 
     previous_close = frame["c"].shift(1)
-
-    tr = pd.concat(
-        [
-            frame["h"] - frame["l"],
-            (frame["h"] - previous_close).abs(),
-            (frame["l"] - previous_close).abs()
-        ],
-        axis=1
-    ).max(axis=1)
-
-    frame["atr"] = tr.ewm(
-        alpha=1 / 14,
-        adjust=False,
-        min_periods=14
-    ).mean()
-
-    frame["ema20"] = frame["c"].ewm(
-        span=20,
-        adjust=False
-    ).mean()
-
+    tr = pd.concat([frame["h"] - frame["l"], (frame["h"] - previous_close).abs(), (frame["l"] - previous_close).abs()], axis=1).max(axis=1)
+    frame["atr"] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
     return frame
 
-
-def rolling_pct(series, window):
-    min_periods = max(10, window // 4)
-
-    return series.rolling(
-        window,
-        min_periods=min_periods
-    ).apply(
-        lambda x: (
-            float((x <= x[-1]).mean())
-            if len(x) > 0 else 0.5
-        ),
-        raw=True
-    )
-
-
-def get_context(frame):
-    current = frame.iloc[-1]
-
-    spot_flow = frame["spot_delta"].iloc[-3:].sum()
-    perp_flow = frame["perp_delta"].iloc[-3:].sum()
-
-    if (
-        current["c"] > current["ema20"]
-        and spot_flow > 0
-        and perp_flow > 0
-    ):
-        return "bullish"
-
-    if (
-        current["c"] < current["ema20"]
-        and spot_flow < 0
-        and perp_flow < 0
-    ):
-        return "bearish"
-
-    return "neutral"
-
-
-def detect_divergence(
-    frame,
-    bullish,
-    lookback=40,
-    order=2,
-    min_gap=3,
-    max_gap=15,
-    max_age=12
-):
-    if len(frame) < lookback:
-        return False
-
+# Вспомогательная функция для поиска дивергенции (усиленная)
+def detect_divergence(frame, bullish, lookback=40, order=2, min_gap=3, max_gap=15, max_age=12):
+    if len(frame) < lookback: return False
     window = frame.iloc[-lookback:]
-
-    prices = (
-        window["l"] if bullish else window["h"]
-    ).to_numpy()
-
+    prices = (window["l"] if bullish else window["h"]).to_numpy()
     cvd = window["spot_cvd"].to_numpy()
+    volumes = window["v"].to_numpy()
+    avg_vol = volumes.mean()
     n = len(prices)
+    
     pivots = []
-
     for i in range(order, n - order):
-        left = prices[i - order:i]
-        right = prices[i + 1:i + 1 + order]
+        left = prices[i - order:i]; right = prices[i + 1:i + 1 + order]
+        if volumes[i] < avg_vol * 1.1: continue # Требуем объем на пивоте
+        if bullish and prices[i] < left.min() and prices[i] < right.min(): pivots.append(i)
+        elif not bullish and prices[i] > left.max() and prices[i] > right.max(): pivots.append(i)
 
-        if bullish:
-            if prices[i] < left.min() and prices[i] < right.min():
-                pivots.append(i)
-        else:
-            if prices[i] > left.max() and prices[i] > right.max():
-                pivots.append(i)
-
-    if len(pivots) < 2:
-        return False
-
+    if len(pivots) < 2: return False
     for k in range(len(pivots) - 1, 0, -1):
         i2 = pivots[k]
-
-        if n - 1 - i2 > max_age:
-            continue
-
+        if n - 1 - i2 > max_age: continue
         for j in range(k - 1, -1, -1):
-            i1 = pivots[j]
-            gap = i2 - i1
-
-            if gap < min_gap:
-                continue
-
-            if gap > max_gap:
-                break
-
-            if bullish:
-                if prices[i2] < prices[i1] and cvd[i2] > cvd[i1]:
-                    return True
-            else:
-                if prices[i2] > prices[i1] and cvd[i2] < cvd[i1]:
-                    return True
-
+            i1 = pivots[j]; gap = i2 - i1
+            if gap < min_gap: continue
+            if gap > max_gap: break
+            if bullish and prices[i2] < prices[i1] and cvd[i2] > cvd[i1]: return True
+            if not bullish and prices[i2] > prices[i1] and cvd[i2] < cvd[i1]: return True
     return False
 
+def load_market_data(client, market, tf, boundary, coin="?"):
+    spot_m = market["spot_by_tf"].get(tf)
+    if not spot_m: raise DataError(f"No spot {coin} {tf}")
+    
+    perp = client.history("ohlcv-history", market["perp"]["symbol"], tf, boundary, ["o", "h", "l", "c", "v", "bv"])
+    spot = client.history("ohlcv-history", spot_m["symbol"], tf, boundary, ["v", "bv", "c"])
+    oi = client.history("open-interest-history", market["perp"]["symbol"], tf, boundary, ["c"])
+    funding = client.history("funding-rate-history", market["perp"]["symbol"], tf, boundary, ["c"])
+    
+    try: liq = client.history("liquidation-history", market["perp"]["symbol"], tf, boundary, ["l", "s"], usd=True)
+    except: liq = pd.DataFrame(columns=["l", "s"], index=pd.Index([], name="t"))
 
-def finite_value(value):
-    try:
-        result = float(value)
-        return result if np.isfinite(result) else None
-    except (TypeError, ValueError):
-        return None
+    try: ls = client.history("long-short-ratio-history", market["perp"]["symbol"], tf, boundary, ["r"])
+    except: ls = pd.DataFrame(columns=["r"], index=pd.Index([], name="t"))
 
+    frame = perp.join(spot.rename(columns={"v": "spot_volume", "bv": "spot_buy_volume", "c": "spot_close"}), how="inner")
+    frame = frame.join(oi.rename(columns={"c": "oi"}), how="inner")
+    frame = frame.join(funding.rename(columns={"c": "funding"}), how="inner")
+    
+    if not liq.empty: frame = frame.join(liq.rename(columns={"l": "long_liq", "s": "short_liq"}), how="left")
+    else: frame["long_liq"] = np.nan; frame["short_liq"] = np.nan
+        
+    if not ls.empty: frame["ls_ratio"] = ls["r"].where(ls["r"] > 0).reindex(frame.index)
+    else: frame["ls_ratio"] = np.nan
+
+    if len(frame) < REQUIRED_BARS: raise DataError(f"Not enough bars: {len(frame)}")
+    return add_indicators(frame)
 
 def analyze_orderflow(frame):
-    current = frame.iloc[-1]
-    previous = frame.iloc[-2]
+    current = frame.iloc[-1]; prev = frame.iloc[-2]
+    atr = current["atr"]
+    if not np.isfinite(atr) or atr <= 0: return [], "Bad ATR"
 
-    atr = finite_value(frame["atr"].iloc[-2])
+    c_range = current["h"] - current["l"]
+    if c_range < atr * 0.35 or c_range > atr * 3: return [], "Bad candle size"
 
-    if atr is None or atr <= 0:
-        return [], "Некорректный ATR"
-
-    candle_range = current["h"] - current["l"]
-
-    if candle_range < atr * 0.35:
-        return [], "Маленькая свеча"
-
-    if candle_range > atr * 3:
-        return [], "Растянутая свеча"
-
-    average_volume = frame["v"].iloc[-21:-1].mean()
-
-    if (
-        average_volume <= 0
-        or current["v"] <= 0
-        or current["spot_volume"] <= 0
-    ):
-        return [], "Мало объёма"
-
-    high_volume = (
-        current["v"] > average_volume * VOLUME_MULTIPLIER
-    )
+    avg_vol = frame["v"].iloc[-21:-1].mean()
+    high_vol = current["v"] > avg_vol * VOLUME_MULTIPLIER
 
     prior_low = frame["l"].iloc[-21:-1].min()
     prior_high = frame["h"].iloc[-21:-1].max()
+    swept_low = current["l"] < prior_low and current["c"] > prior_low
+    swept_high = current["h"] > prior_high and current["c"] < prior_high
 
-    swept_low = (
-        current["l"] < prior_low
-        and current["c"] > prior_low
-    )
-
-    swept_high = (
-        current["h"] > prior_high
-        and current["c"] < prior_high
-    )
-
-    bullish_fvg = current["l"] > frame["h"].iloc[-3]
-    bearish_fvg = current["h"] < frame["l"].iloc[-3]
-
-    oi_change = (
-        current["oi"] / frame["oi"].iloc[-4] - 1
-    ) * 100
-
+    oi_change = (current["oi"] / frame["oi"].iloc[-4] - 1) * 100
     oi_buildup = oi_change > OI_THRESHOLD
     oi_flush = oi_change < -OI_THRESHOLD
 
-    spot_flow = frame["spot_delta"].iloc[-3:].sum()
-    perp_flow = frame["perp_delta"].iloc[-3:].sum()
+    spot_up = current["spot_share"] > MIN_DELTA_SHARE and frame["spot_delta"].iloc[-3:].sum() > 0
+    spot_down = current["spot_share"] < -MIN_DELTA_SHARE and frame["spot_delta"].iloc[-3:].sum() < 0
+    perp_up = current["perp_share"] > MIN_DELTA_SHARE and frame["perp_delta"].iloc[-3:].sum() > 0
+    perp_down = current["perp_share"] < -MIN_DELTA_SHARE and frame["perp_delta"].iloc[-3:].sum() < 0
 
-    spot_up = (
-        current["spot_share"] > MIN_DELTA_SHARE
-        and spot_flow > 0
-    )
+    bull_div = detect_divergence(frame, True)
+    bear_div = detect_divergence(frame, False)
+    body = current["c"] - current["o"]
 
-    spot_down = (
-        current["spot_share"] < -MIN_DELTA_SHARE
-        and spot_flow < 0
-    )
+    bull_abs = current["perp_share"] < -MIN_DELTA_SHARE*2 and body > 0.4*atr and body > 0
+    bear_abs = current["perp_share"] > MIN_DELTA_SHARE*2 and body < -0.4*atr and body < 0
 
-    perp_up = (
-        current["perp_share"] > MIN_DELTA_SHARE
-        and perp_flow > 0
-    )
+    avg_long_liq = frame["long_liq"].iloc[-31:-1].mean() if "long_liq" in frame else 0
+    avg_short_liq = frame["short_liq"].iloc[-31:-1].mean() if "short_liq" in frame else 0
+    long_liq_spike = current.get("long_liq", 0) > 3.0 * max(avg_long_liq, 10000)
+    short_liq_spike = current.get("short_liq", 0) > 3.0 * max(avg_short_liq, 10000)
 
-    perp_down = (
-        current["perp_share"] < -MIN_DELTA_SHARE
-        and perp_flow < 0
-    )
-
-    bullish_div = detect_divergence(frame, True)
-    bearish_div = detect_divergence(frame, False)
-
-    body = float(current["c"] - current["o"])
-
-    bull_abs = (
-        current["perp_share"] < -MIN_DELTA_SHARE * 2
-        and current["v"] > average_volume * 1.3
-        and abs(body) > 0.4 * atr
-        and body > 0
-    )
-
-    bear_abs = (
-        current["perp_share"] > MIN_DELTA_SHARE * 2
-        and current["v"] > average_volume * 1.3
-        and abs(body) > 0.4 * atr
-        and body < 0
-    )
-
-    funding = finite_value(current["funding"])
-
-    if funding is None:
-        return [], "Нет корректного Funding"
-
-    funding_pct = finite_value(
-        rolling_pct(
-            frame["funding"],
-            FUNDING_WINDOW
-        ).iloc[-1]
-    )
-
-    if funding_pct is None:
-        funding_pct = 0.5
-
-    # Дополнительные метрики. Только информационные.
-    # Они НЕ участвуют в расчёте score.
-    ls_ratio = finite_value(current.get("ls_ratio"))
-    ls_long_pct = finite_value(current.get("ls_long_pct"))
-    ls_short_pct = finite_value(current.get("ls_short_pct"))
-
-    long_liq = finite_value(current.get("long_liq_usd"))
-    short_liq = finite_value(current.get("short_liq_usd"))
+    funding = float(current["funding"])
+    ratio = float(current["ls_ratio"]) if pd.notna(current["ls_ratio"]) else None
+    basis = float(current.get("basis", 0))
 
     candidates = []
-    rejected = []
-
+    
     for direction in ["LONG", "SHORT"]:
         is_long = direction == "LONG"
+        if is_long and not spot_up: continue
+        if not is_long and not spot_down: continue
 
-        spot_conf = spot_up if is_long else spot_down
-        perp_conf = perp_up if is_long else perp_down
         sweep = swept_low if is_long else swept_high
-        div = bullish_div if is_long else bearish_div
+        div = bull_div if is_long else bear_div
         absorp = bull_abs if is_long else bear_abs
-
-        if not spot_conf:
-            rejected.append(f"{direction}: Spot нет")
-            continue
-
+        
         if is_long:
-            recovery = (
-                current["c"] > current["o"]
-                and current["c"] > previous["c"]
-            )
-
-            breakout = (
-                current["c"] > prior_high + 0.1 * atr
-            )
-
+            rec = current["c"] > current["o"] and current["c"] > prev["c"]
+            breakout = current["c"] > prior_high + 0.1 * atr
+            rev_liq = long_liq_spike; imp_liq = short_liq_spike
         else:
-            recovery = (
-                current["c"] < current["o"]
-                and current["c"] < previous["c"]
-            )
+            rec = current["c"] < current["o"] and current["c"] < prev["c"]
+            breakout = current["c"] < prior_low - 0.1 * atr
+            rev_liq = short_liq_spike; imp_liq = long_liq_spike
 
-            breakout = (
-                current["c"] < prior_low - 0.1 * atr
-            )
+        reversal = bool(rec and (sweep or div) and (absorp or oi_flush or rev_liq))
+        impulse = bool(breakout and (perp_up if is_long else perp_down) and oi_buildup and high_vol)
 
-        reversal = bool(
-            recovery
-            and (sweep or div)
-            and (absorp or oi_flush)
-        )
+        if not reversal and not impulse: continue
 
-        impulse = bool(
-            breakout
-            and perp_conf
-            and oi_buildup
-            and high_volume
-        )
+        score = 5
+        reasons = [f"Spot OK ({current['spot_share']*100:.1f}%)"]
+        
+        # Начисляем баллы за то, что ты выделил: Дивергенция и Ликвидации
+        if div: 
+            score += 2 # Усилили вес дивергенции!
+            reasons.append("Дивергенция CVD")
+            
+        if (reversal and rev_liq) or (impulse and imp_liq): 
+            score += 2 # Усилили вес ликвидаций!
+            reasons.append("Всплеск ликвидаций")
 
-        if not reversal and not impulse:
-            rejected.append(f"{direction}: нет сценария")
-            continue
+        if ratio is not None:
+            if is_long:
+                if ratio < 0.8: score += 1; reasons.append(f"L/S {ratio:.2f} (Сквиз)")
+                elif ratio > 1.8: score -= 1
+            else:
+                if ratio > 1.5: score += 1; reasons.append(f"L/S {ratio:.2f} (Сквиз)")
+                elif ratio < 0.7: score -= 1
+        
+        if (perp_up if is_long else perp_down) or (reversal and absorp): score += 1; reasons.append("Perp OK")
+        if (impulse and oi_buildup) or (reversal and oi_flush): score += 1; reasons.append(f"OI {oi_change:+.2f}%")
+        if high_vol: score += 1; reasons.append("Объем")
+        
+        if reversal and is_long and funding < -0.01: score += 1; reasons.append("Funding минус")
+        if reversal and not is_long and funding > 0.02: score += 1; reasons.append("Funding плюс")
 
-        if (
-            impulse
-            and is_long
-            and funding > FUNDING_LIMIT
-            and funding_pct > FUNDING_PCT_LIMIT
-        ):
-            rejected.append(f"{direction}: funding")
-            continue
+        if score >= MIN_SCORE:
+            candidates.append({"direction": direction, "setup": "Разворот" if reversal else "Пробой", "score": score, "reasons": reasons, "price": current["c"], "funding": funding, "ls": ratio, "basis": basis, "oi": oi_change})
 
-        if (
-            impulse
-            and not is_long
-            and funding < -FUNDING_LIMIT
-            and funding_pct < (1 - FUNDING_PCT_LIMIT)
-        ):
-            rejected.append(f"{direction}: funding")
-            continue
-
-        setup = "Разворот" if reversal else "Пробой"
-
-        score = 4
-
-        reasons = [
-            "Spot: дельта",
-            ("Разворот" if reversal else "Пробой")
-        ]
-
-        if perp_conf or (reversal and absorp):
-            score += 1
-            reasons.append("Perp")
-
-        if (impulse and oi_buildup) or (reversal and oi_flush):
-            score += 1
-            reasons.append("OI")
-
-        if div:
-            score += 1
-            reasons.append("Дивергенция")
-
-        if high_volume:
-            score += 1
-            reasons.append("Объём")
-
-        # L/S Ratio намеренно НЕ добавляет баллы.
-        # Ликвидации намеренно НЕ меняют score.
-        if score < MIN_SCORE:
-            rejected.append(
-                f"{direction}: score={score}"
-            )
-            continue
-
-        candidates.append({
-            "direction": direction,
-            "setup": setup,
-            "score": int(score),
-            "reasons": reasons,
-            "price": float(current["c"]),
-            "atr": atr,
-            "oi_change": float(oi_change),
-            "funding": funding,
-            "funding_pct": funding_pct,
-            "spot_delta_pct": float(
-                current["spot_share"] * 100
-            ),
-            "perp_delta_pct": float(
-                current["perp_share"] * 100
-            ),
-            "long_liq": long_liq,
-            "short_liq": short_liq,
-            "ls_ratio": ls_ratio,
-            "ls_long_pct": ls_long_pct,
-            "ls_short_pct": ls_short_pct,
-            "fvg": bool(
-                bullish_fvg if is_long else bearish_fvg
-            )
-        })
-
-    return candidates, "; ".join(rejected)
-
+    return candidates, ""
 
 # ============================================================
-# РЫНОЧНЫЙ КОНТЕКСТ — ВАРИАНТ Б
+# ТЕЛЕГРАМ И БД
 # ============================================================
-
-def build_market_context(cache, active_watchlist, tf, boundaries):
-    bullish = []
-    bearish = []
-    neutral = []
-
-    target_boundary = boundaries[tf]
-
-    for coin in active_watchlist:
-        rec = cache.get((coin, tf))
-
-        if not rec or rec.get("boundary") != target_boundary:
-            continue
-
-        frame = rec.get("frame")
-
-        if frame is None or len(frame) < 3:
-            continue
-
-        try:
-            context = get_context(frame)
-        except Exception as exc:
-            logger.warning(
-                "MARKET CONTEXT ERROR | %s %s | %s",
-                coin,
-                tf,
-                exc
-            )
-            continue
-
-        if context == "bullish":
-            bullish.append(coin)
-        elif context == "bearish":
-            bearish.append(coin)
-        else:
-            neutral.append(coin)
-
-    total = len(bullish) + len(bearish) + len(neutral)
-
-    if total == 0:
-        breadth_label = "Недостаточно данных"
-        strength = "не определена"
-    else:
-        bullish_share = len(bullish) / total
-        bearish_share = len(bearish) / total
-
-        if bullish_share >= 0.50 and len(bullish) > len(bearish):
-            breadth_label = "Bullish"
-            strength = (
-                "сильное" if bullish_share >= 0.67
-                else "умеренное"
-            )
-        elif bearish_share >= 0.50 and len(bearish) > len(bullish):
-            breadth_label = "Bearish"
-            strength = (
-                "сильное" if bearish_share >= 0.67
-                else "умеренное"
-            )
-        else:
-            breadth_label = "Mixed / Neutral"
-            strength = "смешанное"
-
-    btc_context = "нет данных"
-
-    btc_rec = cache.get(("BTC", "4h"))
-
-    if (
-        btc_rec
-        and btc_rec.get("boundary") == boundaries.get("4h")
-        and btc_rec.get("frame") is not None
-        and len(btc_rec["frame"]) >= 3
-    ):
-        try:
-            btc_value = get_context(btc_rec["frame"])
-
-            btc_context = {
-                "bullish": "Bullish",
-                "bearish": "Bearish",
-                "neutral": "Neutral"
-            }.get(btc_value, "нет данных")
-        except Exception:
-            btc_context = "нет данных"
-
-    return {
-        "timeframe": tf,
-        "label": breadth_label,
-        "strength": strength,
-        "bullish": bullish,
-        "bearish": bearish,
-        "neutral": neutral,
-        "total": total,
-        "btc_4h": btc_context
-    }
-
-
-def format_market_context(context):
-    if not context:
-        return [
-            "🌐 <b>РЫНОЧНЫЙ КОНТЕКСТ</b>",
-            "Нет достаточных данных"
-        ]
-
-    bullish = context["bullish"]
-    bearish = context["bearish"]
-    neutral = context["neutral"]
-    total = context["total"]
-
-    lines = [
-        "🌐 <b>РЫНОЧНЫЙ КОНТЕКСТ</b>",
-        f"Общее направление: <b>{context['label']}</b>",
-        (
-            f"Монеты ({context['timeframe'].upper()}): "
-            f"🟢 {len(bullish)} LONG / "
-            f"🔴 {len(bearish)} SHORT / "
-            f"⚪ {len(neutral)} Neutral"
-        ),
-        f"BTC 4H: <b>{context['btc_4h']}</b>",
-        f"Оценка подтверждения: {context['strength']}"
-    ]
-
-    if total:
-        lines.append(
-            f"Доступно для оценки: {total} монет"
-        )
-
-    return lines
-
-
-# ============================================================
-# ХРАНИЛИЩЕ СОСТОЯНИЯ
-# ============================================================
-
 class StateStore:
     def __init__(self):
         self.db = sqlite3.connect(STATE_DB)
-
-        self.db.execute(
-            "CREATE TABLE IF NOT EXISTS of_signals "
-            "(id TEXT PRIMARY KEY, coin TEXT, timeframe TEXT, "
-            "direction TEXT, candle INTEGER, mode TEXT)"
-        )
-
+        self.db.execute("CREATE TABLE IF NOT EXISTS signals (id TEXT PRIMARY KEY)")
         self.db.commit()
-
-    def already_sent(self, coin, tf, direction, candle):
-        mode = "dry" if DRY_RUN else "live"
-
-        sid = f"{coin}:{tf}:{direction}:{candle}:{mode}"
-
-        return self.db.execute(
-            "SELECT 1 FROM of_signals WHERE id=?",
-            (sid,)
-        ).fetchone() is not None
-
-    def mark_sent(self, coin, tf, direction, candle):
-        mode = "dry" if DRY_RUN else "live"
-
-        sid = f"{coin}:{tf}:{direction}:{candle}:{mode}"
-
-        self.db.execute(
-            "INSERT OR IGNORE INTO of_signals VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                sid,
-                coin,
-                tf,
-                direction,
-                int(candle),
-                mode
-            )
-        )
-
+    def sent(self, c, tf, d, cd): return self.db.execute("SELECT 1 FROM signals WHERE id=?", (f"{c}:{tf}:{d}:{cd}",)).fetchone() is not None
+    def mark(self, c, tf, d, cd):
+        self.db.execute("INSERT OR IGNORE INTO signals VALUES (?)", (f"{c}:{tf}:{d}:{cd}",))
         self.db.commit()
-
-
-# ============================================================
-# ЗАГРУЗКА РЫНОЧНЫХ ДАННЫХ
-# ============================================================
-
-def load_market_data(
-    client,
-    market,
-    tf,
-    boundary,
-    coin="?"
-):
-    spot_market = market.get(
-        "spot_by_tf",
-        {}
-    ).get(tf)
-
-    if spot_market is None:
-        raise DataError(
-            f"для {coin} {tf} нет Spot-рынка "
-            f"с историей >= {REQUIRED_BARS} баров"
-        )
-
-    perp_sym = market["perp"]["symbol"]
-    spot_sym = spot_market["symbol"]
-
-    # Основные данные — обязательные.
-    perp = client.history(
-        "ohlcv-history",
-        perp_sym,
-        tf,
-        boundary,
-        ["o", "h", "l", "c", "v", "bv"]
-    )
-
-    logger.info(
-        "DATA PART | %s %s | Perp=%d",
-        coin, tf, len(perp)
-    )
-
-    spot = client.history(
-        "ohlcv-history",
-        spot_sym,
-        tf,
-        boundary,
-        ["v", "bv"]
-    )
-
-    logger.info(
-        "DATA PART | %s %s | Spot=%d",
-        coin, tf, len(spot)
-    )
-
-    oi = client.history(
-        "open-interest-history",
-        perp_sym,
-        tf,
-        boundary,
-        ["c"]
-    )
-
-    logger.info(
-        "DATA PART | %s %s | OI=%d",
-        coin, tf, len(oi)
-    )
-
-    funding = client.history(
-        "funding-rate-history",
-        perp_sym,
-        tf,
-        boundary,
-        ["c"]
-    )
-
-    logger.info(
-        "DATA PART | %s %s | Funding=%d",
-        coin, tf, len(funding)
-    )
-
-    # Дополнительные данные — необязательные.
-    # Ошибка этих endpoint не должна ломать основной анализ.
-    liquidations = client.optional_history(
-        "liquidation-history",
-        perp_sym,
-        tf,
-        boundary,
-        ["l", "s"],
-        usd=True
-    )
-
-    has_ls_data = bool(
-        market["perp"].get("has_long_short_ratio_data")
-    )
-
-    if has_ls_data:
-        ls_history = client.optional_history(
-            "long-short-ratio-history",
-            perp_sym,
-            tf,
-            boundary,
-            ["r", "l", "s"]
-        )
-    else:
-        ls_history = pd.DataFrame(
-            columns=["r", "l", "s"],
-            index=pd.Index([], name="t")
-        )
-
-    # Сборка основных данных.
-    frame = perp.join(
-        spot.rename(
-            columns={
-                "v": "spot_volume",
-                "bv": "spot_buy_volume"
-            }
-        ),
-        how="inner"
-    )
-
-    count_after_spot = len(frame)
-
-    frame = frame.join(
-        oi.rename(columns={"c": "oi"}),
-        how="inner"
-    )
-
-    count_after_oi = len(frame)
-
-    frame = frame.join(
-        funding.rename(columns={"c": "funding"}),
-        how="inner"
-    )
-
-    count_after_funding = len(frame)
-
-    # Ликвидации: l — ликвидации LONG, s — ликвидации SHORT.
-    if not liquidations.empty:
-        liquidations = liquidations.rename(
-            columns={
-                "l": "long_liq_usd",
-                "s": "short_liq_usd"
-            }
-        )
-
-        frame = frame.join(
-            liquidations[
-                ["long_liq_usd", "short_liq_usd"]
-            ],
-            how="left"
-        )
-    else:
-        frame["long_liq_usd"] = np.nan
-        frame["short_liq_usd"] = np.nan
-
-    # Long/Short Ratio:
-    # r — коэффициент Long/Short;
-    # l — доля Long в процентах;
-    # s — доля Short в процентах.
-    if not ls_history.empty:
-        ls_history = ls_history.rename(
-            columns={
-                "r": "ls_ratio",
-                "l": "ls_long_pct",
-                "s": "ls_short_pct"
-            }
-        )
-
-        frame = frame.join(
-            ls_history[
-                ["ls_ratio", "ls_long_pct", "ls_short_pct"]
-            ],
-            how="left"
-        )
-    else:
-        frame["ls_ratio"] = np.nan
-        frame["ls_long_pct"] = np.nan
-        frame["ls_short_pct"] = np.nan
-
-    logger.info(
-        "DATA JOIN | %s %s | Perp=%d Spot=%d OI=%d Funding=%d | "
-        "after_spot=%d after_oi=%d after_funding=%d final=%d",
-        coin,
-        tf,
-        len(perp),
-        len(spot),
-        len(oi),
-        len(funding),
-        count_after_spot,
-        count_after_oi,
-        count_after_funding,
-        len(frame)
-    )
-
-    logger.info(
-        "DERIVATIVES DATA | %s %s | "
-        "Liquidations points=%d | L/S points=%d | "
-        "L/S supported=%s",
-        coin,
-        tf,
-        len(liquidations),
-        len(ls_history),
-        has_ls_data
-    )
-
-    if len(frame) < REQUIRED_BARS:
-        raise DataError(
-            f"Мало баров после inner join: {len(frame)} < {REQUIRED_BARS} "
-            f"(Perp={len(perp)}, Spot={len(spot)}, "
-            f"OI={len(oi)}, Funding={len(funding)})"
-        )
-
-    return add_indicators(frame)
-
-
-# ============================================================
-# ФОРМАТИРОВАНИЕ ДОПОЛНИТЕЛЬНЫХ ДАННЫХ
-# ============================================================
-
-def format_usd(value):
-    value = finite_value(value)
-
-    if value is None:
-        return "N/A"
-
-    absolute = abs(value)
-
-    if absolute >= 1_000_000:
-        return f"${value / 1_000_000:,.2f}M"
-
-    if absolute >= 1_000:
-        return f"${value / 1_000:,.1f}K"
-
-    return f"${value:,.0f}"
-
-
-def format_ratio(value):
-    value = finite_value(value)
-
-    if value is None:
-        return "N/A"
-
-    return f"{value:.2f}"
-
-
-def format_percent(value):
-    value = finite_value(value)
-
-    if value is None:
-        return "N/A"
-
-    return f"{value:.1f}%"
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
 
 def send_telegram(text):
-    if DRY_RUN:
-        logger.info(
-            "DRY_RUN: %s",
-            text
-        )
-        return True
-
+    if DRY_RUN: logger.info(f"DRY_RUN:\n{text}"); return True
     try:
-        res = requests.post(
-            (
-                "https://api.telegram.org/"
-                f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            ),
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML"
-            },
-            timeout=20
-        )
+        return requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=20).status_code == 200
+    except: return False
 
-        if res.status_code != 200:
-            logger.warning(
-                "Telegram error | HTTP %s | %s",
-                res.status_code,
-                res.text[:500]
-            )
-            return False
-
-        return True
-
-    except Exception as exc:
-        logger.warning(
-            "Telegram send failed: %s",
-            exc
-        )
-        return False
-
-
-def format_signal(
-    coin,
-    tf,
-    candle,
-    signal,
-    detected_at,
-    market_context=None
-):
-    signal_time = candle + TIMEFRAMES[tf][0]
-
-    age_seconds = max(
-        0,
-        int(detected_at) - signal_time
-    )
-
-    signal_time_text = datetime.fromtimestamp(
-        signal_time,
-        LOCAL_TIMEZONE
-    ).strftime("%Y-%m-%d %H:%M")
-
-    detected_text = datetime.fromtimestamp(
-        detected_at,
-        LOCAL_TIMEZONE
-    ).strftime("%Y-%m-%d %H:%M:%S")
-
-    age_minutes = age_seconds // 60
-
-    emoji = (
-        "🟢"
-        if signal["direction"] == "LONG"
-        else "🔴"
-    )
-
-    ls_ratio = format_ratio(signal.get("ls_ratio"))
-    ls_long = format_percent(signal.get("ls_long_pct"))
-    ls_short = format_percent(signal.get("ls_short_pct"))
-
-    long_liq = format_usd(signal.get("long_liq"))
-    short_liq = format_usd(signal.get("short_liq"))
-
-    lines = [
-        (
-            f"{emoji} <b>ORDER FLOW | "
-            f"{tf.upper()} {signal['direction']}</b>"
-        ),
-        "",
-        f"Монета: <b>#{html.escape(coin)}USDT</b>",
-        f"Цена сигнала: <b>{signal['price']:,.4f}</b>",
-        (
-            f"Время сигнала (закрытие свечи): "
-            f"<b>{signal_time_text} Хабаровск</b>"
-        ),
-        (
-            f"Бот обнаружил/отправляет: "
-            f"<b>{detected_text} Хабаровск</b>"
-        ),
-        f"Возраст сигнала: {age_minutes} мин.",
-        f"Сетап: {signal['setup']}",
-        f"Баллы: {signal['score']}/8",
-        "",
-        "📊 <b>ORDER FLOW</b>",
-        f"Spot Delta: {signal['spot_delta_pct']:+.1f}%",
-        f"Perp Delta: {signal['perp_delta_pct']:+.1f}%",
-        f"🏦 OI: {signal['oi_change']:+.2f}%",
-        f"💰 Funding: {signal['funding']:+.4f}%",
-        "",
-        "⚖️ <b>LONG / SHORT RATIO</b>",
-        f"L/S Ratio: <b>{ls_ratio}</b>",
-        f"Long accounts: {ls_long}",
-        f"Short accounts: {ls_short}",
-        "",
-        "💥 <b>LIQUIDATIONS</b>",
-        f"Long liquidations: <b>{long_liq}</b>",
-        f"Short liquidations: <b>{short_liq}</b>",
-        "",
-    ]
-
-    lines.extend(
-        format_market_context(market_context)
-    )
-
-    lines.extend([
-        "",
-        (
-            "ℹ️ L/S Ratio и ликвидации — дополнительные "
-            "рыночные данные. На баллы и формирование сигнала "
-            "пока не влияют."
-        ),
-        (
-            "⚠️ Ликвидации показывают объём в USD по данным "
-            "поддерживаемого Coinalyze рынка, а не количество "
-            "ликвидированных трейдеров."
-        )
-    ])
-
-    return NL.join(lines)
-
+def format_signal(coin, tf, candle, sig):
+    t = (candle + TIMEFRAMES[tf][0])
+    time_str = datetime.fromtimestamp(t, LOCAL_TIMEZONE).strftime("%H:%M")
+    emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
+    ls_str = f'{sig["ls"]:.2f}' if sig["ls"] else "n/a"
+    
+    msg = f"{emoji} <b>{coin} | {tf.upper()} {sig['direction']}</b>\n"
+    msg += f"Цена: {sig['price']:,.2f} | Время: {time_str}\n"
+    msg += f"Сетап: {sig['setup']} (Баллы: {sig['score']})\n\n"
+    msg += f"📊 L/S: {ls_str} | Базис: {sig['basis']:.3f}%\n"
+    msg += f"🏦 OI: {sig['oi']:+.2f}% | Funding: {sig['funding']:+.4f}%\n\n"
+    msg += "Причины:\n" + "\n".join([f"• {r}" for r in sig["reasons"]])
+    return msg
 
 # ============================================================
-# ОСНОВНОЙ ЦИКЛ
+# ЗАПУСК
 # ============================================================
-
 def main():
-    threading.Thread(
-        target=start_health_server,
-        daemon=True
-    ).start()
-
-    threading.Thread(
-        target=self_ping_worker,
-        daemon=True
-    ).start()
-
+    threading.Thread(target=start_health_server, daemon=True).start()
+    threading.Thread(target=self_ping_worker, daemon=True).start()
+    
     client = CoinalyzeClient()
     state = StateStore()
+    cache, processed = {}, set()
 
-    cache = {}
-    processed = set()
-    retry_after = {}
-    spot_retry_after = {}
-
-    logger.info(
-        "CONFIG | REQUESTED_WATCHLIST=%s | TIMEFRAMES=%s | "
-        "MIN_SCORE=%d | REQUIRED_BARS=%d | "
-        "MAX_SIGNAL_DELAY_1H=%d sec | MAX_SIGNAL_DELAY_4H=%d sec | "
-        "TIMEZONE=%s | DRY_RUN=%s",
-        ",".join(WATCHLIST),
-        ",".join(LOAD_ORDER),
-        MIN_SCORE,
-        REQUIRED_BARS,
-        MAX_SIGNAL_DELAY_BY_TF["1h"],
-        MAX_SIGNAL_DELAY_BY_TF["4h"],
-        TIMEZONE_NAME,
-        DRY_RUN
-    )
-
-    if MIN_SCORE > 8:
-        logger.warning(
-            "CONFIG WARNING | MIN_SCORE=%d выше текущего максимума 8: "
-            "сигналы не пройдут score-фильтр",
-            MIN_SCORE
-        )
-
-    send_telegram(
-        f"🚀 <b>Order Flow запущен</b>\n"
-        f"Монеты: {', '.join(WATCHLIST)}\n"
-        f"Таймфреймы: 1H / 4H\n"
-        f"Время уведомлений: {TIMEZONE_NAME}\n"
-        f"Режим: {'DRY RUN' if DRY_RUN else 'LIVE'}"
-    )
-
-    HEALTH["status"] = "starting"
-
+    send_telegram("🚀 <b>Гибридный Order Flow Bot (Без EMA200) запущен</b>")
     market_map = build_market_map(client)
-    active_watchlist = list(market_map)
-
-    # На каждую монету и TF:
-    # 4 обязательных + 2 дополнительных запроса.
-    estimated_calls = (
-        len(active_watchlist) * len(TIMEFRAMES) * 6
-    )
-
-    logger.info(
-        "SCHEDULER | активных монет=%d | таймфреймов=%d | "
-        "запросов на полное обновление до=%d | лимит=%d запросов/%d сек",
-        len(active_watchlist),
-        len(TIMEFRAMES),
-        estimated_calls,
-        client.MAX_CALLS_PER_WINDOW,
-        int(client.WINDOW_SECONDS)
-    )
-
-    if len(active_watchlist) < 3:
-        logger.warning(
-            "WATCHLIST WARNING | доступно менее 3 монет: %s",
-            ",".join(active_watchlist)
-        )
-
-    HEALTH["status"] = "running"
+    if not market_map: raise Exception("Нет монет для торговли")
 
     while True:
         now = int(time.time())
-
-        boundaries = {
-            tf: (
-                (now - CLOSE_DELAY) // spec[0]
-            ) * spec[0]
-            for tf, spec in TIMEFRAMES.items()
-        }
-
-        # ----------------------------------------------------
-        # ЗАГРУЗКА ДАННЫХ И ВОССТАНОВЛЕНИЕ SPOT
-        # ----------------------------------------------------
-
+        boundaries = {tf: (now - CLOSE_DELAY) // spec[0] * spec[0] for tf, spec in TIMEFRAMES.items()}
+        
+        # Загрузка
         for tf in LOAD_ORDER:
-            for coin in active_watchlist:
-
-                if (
-                    market_map[coin]
-                    .get("spot_by_tf", {})
-                    .get(tf) is None
-                ):
-                    spot_retry_key = (coin, tf)
-
-                    next_check = spot_retry_after.get(
-                        spot_retry_key,
-                        0
-                    )
-
-                    if now >= next_check:
-                        spot_retry_after[spot_retry_key] = (
-                            now + SPOT_RECHECK_SECONDS
-                        )
-
-                        try:
-                            recovered = find_spot_market(
-                                client,
-                                coin,
-                                tf
-                            )
-
-                            if recovered is not None:
-                                market_map[coin]["spot_by_tf"][tf] = (
-                                    recovered
-                                )
-
-                                spot_retry_after.pop(
-                                    spot_retry_key,
-                                    None
-                                )
-
-                                logger.info(
-                                    "SPOT AUTO-ENABLED | %s %s | %s",
-                                    coin,
-                                    tf,
-                                    recovered["symbol"]
-                                )
-
-                        except Exception as exc:
-                            logger.warning(
-                                "SPOT AUTO-RECHECK FAILED | %s %s | %s",
-                                coin,
-                                tf,
-                                exc
-                            )
-
-                    if (
-                        market_map[coin]
-                        .get("spot_by_tf", {})
-                        .get(tf) is None
-                    ):
-                        continue
-
-                key = (coin, tf)
-                boundary = boundaries[tf]
-
-                if (
-                    cache.get(key)
-                    and cache[key]["boundary"] == boundary
-                ):
-                    continue
-
-                retry_key = (coin, tf, boundary)
-
-                retry_time = retry_after.get(
-                    retry_key,
-                    0
-                )
-
-                if now < retry_time:
-                    continue
-
+            for coin in market_map:
+                if cache.get((coin, tf), {}).get("boundary") == boundaries[tf]: continue
                 try:
-                    frame = load_market_data(
-                        client,
-                        market_map[coin],
-                        tf,
-                        boundary,
-                        coin
-                    )
+                    frame = load_market_data(client, market_map[coin], tf, boundaries[tf], coin)
+                    cache[(coin, tf)] = {"boundary": boundaries[tf], "frame": frame}
+                    logger.info(f"DATA OK | {coin} {tf}")
+                except Exception as e:
+                    logger.warning(f"DATA ERR | {coin} {tf} | {e}")
 
-                    cache[key] = {
-                        "boundary": boundary,
-                        "frame": frame
-                    }
-
-                    retry_after.pop(retry_key, None)
-
-                    HEALTH["last_data_success"] = int(time.time())
-                    HEALTH["last_error"] = None
-                    HEALTH["status"] = "running"
-
-                    logger.info(
-                        "DATA OK | %s %s | bars=%s",
-                        coin,
-                        tf,
-                        len(frame)
-                    )
-
-                except Exception as exc:
-                    error_text = str(exc)
-
-                    if "Мало баров после inner join" in error_text:
-                        retry_seconds = max(
-                            DATA_RETRY_SECONDS,
-                            boundary
-                            + TIMEFRAMES[tf][0]
-                            + CLOSE_DELAY
-                            - int(time.time())
-                        )
-
-                        retry_after[retry_key] = (
-                            int(time.time()) + retry_seconds
-                        )
-
-                        retry_message = (
-                            "повтор после следующей свечи "
-                            "(примерно %d сек)"
-                        ) % retry_seconds
-
-                    else:
-                        retry_after[retry_key] = (
-                            int(time.time()) + DATA_RETRY_SECONDS
-                        )
-
-                        retry_message = (
-                            "повтор после %d сек"
-                        ) % DATA_RETRY_SECONDS
-
-                    HEALTH["last_error"] = (
-                        f"{coin} {tf}: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-
-                    HEALTH["status"] = "degraded"
-
-                    logger.warning(
-                        "DATA ERR | %s %s | %s | %s",
-                        coin,
-                        tf,
-                        exc,
-                        retry_message
-                    )
-
-        # ----------------------------------------------------
-        # РАСЧЁТ РЫНОЧНОГО КОНТЕКСТА
-        # ----------------------------------------------------
-
-        market_contexts = {}
-
+        # Анализ
         for tf in LOAD_ORDER:
-            market_contexts[tf] = build_market_context(
-                cache,
-                active_watchlist,
-                tf,
-                boundaries
-            )
-
-            context = market_contexts[tf]
-
-            logger.info(
-                "MARKET CONTEXT | %s | label=%s | "
-                "bullish=%d bearish=%d neutral=%d total=%d | BTC_4H=%s",
-                tf,
-                context["label"],
-                len(context["bullish"]),
-                len(context["bearish"]),
-                len(context["neutral"]),
-                context["total"],
-                context["btc_4h"]
-            )
-
-        # ----------------------------------------------------
-        # АНАЛИЗ СИГНАЛОВ
-        # ----------------------------------------------------
-
-        for tf in LOAD_ORDER:
-            for coin in active_watchlist:
-
-                if (
-                    market_map[coin]
-                    .get("spot_by_tf", {})
-                    .get(tf) is None
-                ):
-                    continue
-
+            for coin in market_map:
                 rec = cache.get((coin, tf))
-
-                if (
-                    not rec
-                    or rec["boundary"] != boundaries[tf]
-                ):
-                    continue
-
+                if not rec or rec["boundary"] != boundaries[tf]: continue
+                
                 frame = rec["frame"]
                 candle = int(frame.index[-1])
+                
+                if (coin, tf, candle) in processed: continue
+                if time.time() - (candle + TIMEFRAMES[tf][0]) > MAX_SIGNAL_DELAY_BY_TF[tf]:
+                    processed.add((coin, tf, candle)); continue
 
-                work_key = (coin, tf, candle)
+                candidates, _ = analyze_orderflow(frame)
+                if len(candidates) == 1:
+                    sig = candidates[0]
+                    if not state.sent(coin, tf, sig["direction"], candle):
+                        if send_telegram(format_signal(coin, tf, candle, sig)):
+                            state.mark(coin, tf, sig["direction"], candle)
+                            logger.info(f"SIGNAL SENT | {coin} {tf} {sig['direction']} | Score: {sig['score']}")
+                
+                processed.add((coin, tf, candle))
 
-                if work_key in processed:
-                    continue
-
-                candle_close_time = (
-                    candle + TIMEFRAMES[tf][0]
-                )
-
-                max_signal_age = MAX_SIGNAL_DELAY_BY_TF[tf]
-
-                signal_age = (
-                    int(time.time()) - candle_close_time
-                )
-
-                if (
-                    signal_age < 0
-                    or signal_age > max_signal_age
-                ):
-                    logger.info(
-                        "SIGNAL SKIP STALE | %s %s | age=%d sec | "
-                        "max=%d sec | candle_close=%s",
-                        coin,
-                        tf,
-                        signal_age,
-                        max_signal_age,
-                        datetime.fromtimestamp(
-                            candle_close_time,
-                            LOCAL_TIMEZONE
-                        ).strftime("%Y-%m-%d %H:%M:%S %Z")
-                    )
-
-                    processed.add(work_key)
-                    continue
-
-                candidates, explanation = analyze_orderflow(
-                    frame
-                )
-
-                if not candidates:
-                    logger.info(
-                        "%s %s | skip: %s",
-                        coin,
-                        tf,
-                        explanation
-                    )
-
-                    processed.add(work_key)
-                    continue
-
-                signal = candidates[0]
-
-                if state.already_sent(
-                    coin,
-                    tf,
-                    signal["direction"],
-                    candle
-                ):
-                    processed.add(work_key)
-                    continue
-
-                detected_at = int(time.time())
-
-                signal_age = (
-                    detected_at - candle_close_time
-                )
-
-                if (
-                    signal_age < 0
-                    or signal_age > max_signal_age
-                ):
-                    logger.info(
-                        "SIGNAL SKIP STALE BEFORE SEND | %s %s | "
-                        "age=%d sec | max=%d sec",
-                        coin,
-                        tf,
-                        signal_age,
-                        max_signal_age
-                    )
-
-                    processed.add(work_key)
-                    continue
-
-                message = format_signal(
-                    coin,
-                    tf,
-                    candle,
-                    signal,
-                    detected_at,
-                    market_contexts.get(tf)
-                )
-
-                if send_telegram(message):
-                    state.mark_sent(
-                        coin,
-                        tf,
-                        signal["direction"],
-                        candle
-                    )
-
-                    logger.info(
-                        "SIGNAL: %s %s %s | age=%d sec | "
-                        "market=%s | timezone=%s",
-                        coin,
-                        tf,
-                        signal["direction"],
-                        signal_age,
-                        market_contexts.get(
-                            tf,
-                            {}
-                        ).get("label", "unknown"),
-                        TIMEZONE_NAME
-                    )
-
-                    processed.add(work_key)
-
-        HEALTH["last_cycle"] = int(time.time())
-
-        time.sleep(30)
-
+        time.sleep(15)
 
 if __name__ == "__main__":
     main()
