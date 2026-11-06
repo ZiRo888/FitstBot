@@ -15,7 +15,7 @@ import pandas as pd
 import requests
 
 # ============================================================
-# НАСТРОЙКИ (ФИНАЛЬНАЯ ВЕРСИЯ: 1H + 4H, БЕЗ EMA200)
+# НАСТРОЙКИ (1H + 4H, БЕЗ EMA200, С АЛЕРТАМИ ПО ЛИКВИДАЦИЯМ)
 # ============================================================
 
 API_BASE = "https://api.coinalyze.net/v1"
@@ -33,7 +33,6 @@ except (ZoneInfoNotFoundError, ValueError):
 coins = [value.strip().upper() for value in os.getenv("WATCHLIST", "BTC").split(",") if value.strip()]
 WATCHLIST = list(dict.fromkeys(["BTC"] + coins))
 
-# ТОЛЬКО 1H И 4H (как мы и договорились)
 TIMEFRAMES = {
     "1h": (3600, "1hour"),
     "4h": (14400, "4hour"),
@@ -46,7 +45,6 @@ REQUIRED_BARS = 100
 CLOSE_DELAY = int(os.getenv("CLOSE_DELAY_SECONDS", "45"))
 MAX_SIGNAL_DELAY_BY_TF = {"1h": 3600, "4h": 14400}
 
-# Порог баллов (максимум теперь 10)
 MIN_SCORE = int(os.getenv("MIN_SCORE", "7")) 
 COOLDOWN_BARS = int(os.getenv("COOLDOWN_BARS", "2"))
 
@@ -66,7 +64,7 @@ logger = logging.getLogger("orderflow")
 HEALTH = {"status": "starting", "last_cycle": None, "last_error": None}
 
 # ============================================================
-# ИНФРАСТРУКТУРА (ОТ ДРУГОЙ НЕЙРОСЕТИ - ХОРОШАЯ)
+# ИНФРАСТРУКТУРА
 # ============================================================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -146,7 +144,7 @@ class CoinalyzeClient:
 def find_spot_market(client, coin, tf, boundary):
     spots = client.get("spot-markets")
     candidates = []
-    for ex in ["A", "O", "B", "C"]: # Binance, OKX, Bybit, Coinbase
+    for ex in ["A", "O", "B", "C"]: 
         c = [m for m in spots if m.get("exchange") == ex and m.get("base_asset") == coin and m.get("quote_asset") == "USDT"]
         candidates.extend(sorted(c, key=lambda x: x["symbol"]))
     for cand in candidates:
@@ -178,7 +176,7 @@ def build_market_map(client):
     return mapping
 
 # ============================================================
-# ЛОГИКА АНАЛИЗА (НАША, БЕЗ EMA200)
+# ЛОГИКА АНАЛИЗА
 # ============================================================
 def add_indicators(frame):
     frame = frame.copy()
@@ -197,7 +195,6 @@ def add_indicators(frame):
     frame["atr"] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
     return frame
 
-# Вспомогательная функция для поиска дивергенции (усиленная)
 def detect_divergence(frame, bullish, lookback=40, order=2, min_gap=3, max_gap=15, max_age=12):
     if len(frame) < lookback: return False
     window = frame.iloc[-lookback:]
@@ -210,7 +207,7 @@ def detect_divergence(frame, bullish, lookback=40, order=2, min_gap=3, max_gap=1
     pivots = []
     for i in range(order, n - order):
         left = prices[i - order:i]; right = prices[i + 1:i + 1 + order]
-        if volumes[i] < avg_vol * 1.1: continue # Требуем объем на пивоте
+        if volumes[i] < avg_vol * 1.1: continue 
         if bullish and prices[i] < left.min() and prices[i] < right.min(): pivots.append(i)
         elif not bullish and prices[i] > left.max() and prices[i] > right.max(): pivots.append(i)
 
@@ -257,10 +254,10 @@ def load_market_data(client, market, tf, boundary, coin="?"):
 def analyze_orderflow(frame):
     current = frame.iloc[-1]; prev = frame.iloc[-2]
     atr = current["atr"]
-    if not np.isfinite(atr) or atr <= 0: return [], "Bad ATR"
+    if not np.isfinite(atr) or atr <= 0: return [], "Bad ATR", None
 
     c_range = current["h"] - current["l"]
-    if c_range < atr * 0.35 or c_range > atr * 3: return [], "Bad candle size"
+    if c_range < atr * 0.35 or c_range > atr * 3: return [], "Bad candle size", None
 
     avg_vol = frame["v"].iloc[-21:-1].mean()
     high_vol = current["v"] > avg_vol * VOLUME_MULTIPLIER
@@ -286,10 +283,19 @@ def analyze_orderflow(frame):
     bull_abs = current["perp_share"] < -MIN_DELTA_SHARE*2 and body > 0.4*atr and body > 0
     bear_abs = current["perp_share"] > MIN_DELTA_SHARE*2 and body < -0.4*atr and body < 0
 
+    # === ЛОГИКА ЛИКВИДАЦИЙ (ТРИГГЕР) ===
     avg_long_liq = frame["long_liq"].iloc[-31:-1].mean() if "long_liq" in frame else 0
     avg_short_liq = frame["short_liq"].iloc[-31:-1].mean() if "short_liq" in frame else 0
+    
     long_liq_spike = current.get("long_liq", 0) > 3.0 * max(avg_long_liq, 10000)
     short_liq_spike = current.get("short_liq", 0) > 3.0 * max(avg_short_liq, 10000)
+
+    # Формируем Алерт для Telegram
+    liq_alert = None
+    if long_liq_spike:
+        liq_alert = "⚠️ <b>ВНИМАНИЕ: Вынос ЛОНГОВ</b>"
+    elif short_liq_spike:
+        liq_alert = "⚠️ <b>ВНИМАНИЕ: Вынос ШОРТОВ</b>"
 
     funding = float(current["funding"])
     ratio = float(current["ls_ratio"]) if pd.notna(current["ls_ratio"]) else None
@@ -310,26 +316,36 @@ def analyze_orderflow(frame):
             rec = current["c"] > current["o"] and current["c"] > prev["c"]
             breakout = current["c"] > prior_high + 0.1 * atr
             rev_liq = long_liq_spike; imp_liq = short_liq_spike
+            trap_trigger = short_liq_spike
+            trap_confirm = spot_up and rec
         else:
             rec = current["c"] < current["o"] and current["c"] < prev["c"]
             breakout = current["c"] < prior_low - 0.1 * atr
             rev_liq = short_liq_spike; imp_liq = long_liq_spike
+            trap_trigger = long_liq_spike
+            trap_confirm = spot_down and rec
 
         reversal = bool(rec and (sweep or div) and (absorp or oi_flush or rev_liq))
         impulse = bool(breakout and (perp_up if is_long else perp_down) and oi_buildup and high_vol)
+        
+        # Новая логика: Ловушка после ликвидаций
+        liquidation_trap = bool(trap_trigger and trap_confirm and (perp_up if is_long else perp_down))
 
-        if not reversal and not impulse: continue
+        if not reversal and not impulse and not liquidation_trap: continue
 
         score = 5
         reasons = [f"Spot OK ({current['spot_share']*100:.1f}%)"]
         
-        # Начисляем баллы за то, что ты выделил: Дивергенция и Ликвидации
+        if liquidation_trap:
+            score += 2
+            reasons.append(f"Триггер: {'Вынос шортов' if is_long else 'Вынос лонгов'} + Поток")
+            
         if div: 
-            score += 2 # Усилили вес дивергенции!
+            score += 2 
             reasons.append("Дивергенция CVD")
             
         if (reversal and rev_liq) or (impulse and imp_liq): 
-            score += 2 # Усилили вес ликвидаций!
+            score += 2 
             reasons.append("Всплеск ликвидаций")
 
         if ratio is not None:
@@ -348,9 +364,20 @@ def analyze_orderflow(frame):
         if reversal and not is_long and funding > 0.02: score += 1; reasons.append("Funding плюс")
 
         if score >= MIN_SCORE:
-            candidates.append({"direction": direction, "setup": "Разворот" if reversal else "Пробой", "score": score, "reasons": reasons, "price": current["c"], "funding": funding, "ls": ratio, "basis": basis, "oi": oi_change})
+            setup_name = "Ловушка" if liquidation_trap else ("Разворот" if reversal else "Пробой")
+            candidates.append({
+                "direction": direction, 
+                "setup": setup_name, 
+                "score": score, 
+                "reasons": reasons, 
+                "price": current["c"], 
+                "funding": funding, 
+                "ls": ratio, 
+                "basis": basis, 
+                "oi": oi_change
+            })
 
-    return candidates, ""
+    return candidates, "", liq_alert
 
 # ============================================================
 # ТЕЛЕГРАМ И БД
@@ -396,7 +423,7 @@ def main():
     state = StateStore()
     cache, processed = {}, set()
 
-    send_telegram("🚀 <b>Гибридный Order Flow Bot (Без EMA200) запущен</b>")
+    send_telegram("🚀 <b>Order Flow Bot (v2.0) запущен</b>\nСистема Алертов по ликвидациям активирована.")
     market_map = build_market_map(client)
     if not market_map: raise Exception("Нет монет для торговли")
 
@@ -404,7 +431,7 @@ def main():
         now = int(time.time())
         boundaries = {tf: (now - CLOSE_DELAY) // spec[0] * spec[0] for tf, spec in TIMEFRAMES.items()}
         
-        # Загрузка
+        # Загрузка данных
         for tf in LOAD_ORDER:
             for coin in market_map:
                 if cache.get((coin, tf), {}).get("boundary") == boundaries[tf]: continue
@@ -428,7 +455,17 @@ def main():
                 if time.time() - (candle + TIMEFRAMES[tf][0]) > MAX_SIGNAL_DELAY_BY_TF[tf]:
                     processed.add((coin, tf, candle)); continue
 
-                candidates, _ = analyze_orderflow(frame)
+                # Получаем сигналы и алерт
+                candidates, _, liq_alert = analyze_orderflow(frame)
+
+                # --- ОТПРАВЛЯЕМ АЛЕРТ (Если есть палка) ---
+                alert_key = f"{coin}:{tf}:{candle}:alert"
+                if liq_alert and alert_key not in processed:
+                    alert_msg = f"{liq_alert}\nМонета: <b>{coin}</b> | ТФ: <b>{tf.upper()}</b>\nНачинаю следить за потоком..."
+                    send_telegram(alert_msg)
+                    processed.add(alert_key) # Чтобы не спамил
+
+                # --- ОТПРАВЛЯЕМ СИГНАЛ (Если набрались баллы) ---
                 if len(candidates) == 1:
                     sig = candidates[0]
                     if not state.sent(coin, tf, sig["direction"], candle):
