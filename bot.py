@@ -400,7 +400,7 @@ def send_telegram(text):
 
 def format_signal(coin, tf, candle, sig):
     t = (candle + TIMEFRAMES[tf][0])
-    time_str = datetime.fromtimestamp(t, LOCAL_TIMEZONE).strftime("%H:%M")
+    time_str = datetime.fromtimestamp(t, LOCAL_TIMEZONE).strftime("%d.%m %H:%M")
     emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
     ls_str = f'{sig["ls"]:.2f}' if sig["ls"] else "n/a"
     
@@ -423,7 +423,7 @@ def main():
     state = StateStore()
     cache, processed = {}, set()
 
-    send_telegram("🚀 <b>Order Flow Bot (v2.0) запущен</b>\nСистема Алертов по ликвидациям активирована.")
+    send_telegram("🚀 <b>Order Flow Bot (v2.1) запущен</b>\nСистема Алертов (с датой и временем) активирована.")
     market_map = build_market_map(client)
     if not market_map: raise Exception("Нет монет для торговли")
 
@@ -458,12 +458,29 @@ def main():
                 # Получаем сигналы и алерт
                 candidates, _, liq_alert = analyze_orderflow(frame)
 
-                # --- ОТПРАВЛЯЕМ АЛЕРТ (Если есть палка) ---
+                # --- ОТПРАВЛЯЕМ АЛЕРТ (С датой и временем) ---
                 alert_key = f"{coin}:{tf}:{candle}:alert"
                 if liq_alert and alert_key not in processed:
-                    alert_msg = f"{liq_alert}\nМонета: <b>{coin}</b> | ТФ: <b>{tf.upper()}</b>\nНачинаю следить за потоком..."
+                    # Считаем время закрытия свечи (когда именно была палка)
+                    candle_close_time = candle + TIMEFRAMES[tf][0]
+                    # Переводим в твой часовой пояс
+                    time_str = datetime.fromtimestamp(candle_close_time, LOCAL_TIMEZONE).strftime('%d.%m.%Y %H:%M')
+                    
+                    # Считаем, сколько минут прошло с момента закрытия свечи
+                    age_minutes = int((time.time() - candle_close_time) / 60)
+                    
+                    # Если сигнал пришел с задержкой более 15 минут, добавляем предупреждение
+                    age_text = f"\n⚠️ <i>Задержка: {age_minutes} мин. (старая свеча)</i>" if age_minutes > 15 else ""
+
+                    alert_msg = (
+                        f"{liq_alert}\n"
+                        f"Монета: <b>{coin}</b> | ТФ: <b>{tf.upper()}</b>\n"
+                        f"📅 Время свечи: <b>{time_str}</b>{age_text}\n"
+                        f"Начинаю следить за потоком..."
+                    )
                     send_telegram(alert_msg)
-                    processed.add(alert_key) # Чтобы не спамил
+                    logger.info(f"ALERT SENT | {coin} {tf} | {time_str}")
+                    processed.add(alert_key)
 
                 # --- ОТПРАВЛЯЕМ СИГНАЛ (Если набрались баллы) ---
                 if len(candidates) == 1:
