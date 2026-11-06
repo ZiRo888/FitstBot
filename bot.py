@@ -257,13 +257,21 @@ def analyze_orderflow(frame):
     if not np.isfinite(atr) or atr <= 0: return [], "Bad ATR", None
 
     c_range = current["h"] - current["l"]
-    if c_range < atr * 0.35 or c_range > atr * 3: return [], "Bad candle size", None
+    
+    # --- PANIC SELL LOGIC START ---
+    # Если свеча огромная, мы не блокируем её, а помечаем как панику
+    is_panic = c_range > atr * 3
 
     avg_vol = frame["v"].iloc[-21:-1].mean()
     high_vol = current["v"] > avg_vol * VOLUME_MULTIPLIER
 
     prior_low = frame["l"].iloc[-21:-1].min()
     prior_high = frame["h"].iloc[-21:-1].max()
+    
+    # Жесткий пробой уровня (слом структуры) на огромном объеме
+    panic_breakdown = current["c"] < prior_low - 0.1 * atr and is_panic and high_vol
+    panic_breakout = current["c"] > prior_high + 0.1 * atr and is_panic and high_vol
+
     swept_low = current["l"] < prior_low and current["c"] > prior_low
     swept_high = current["h"] > prior_high and current["c"] < prior_high
 
@@ -290,7 +298,6 @@ def analyze_orderflow(frame):
     long_liq_spike = current.get("long_liq", 0) > 3.0 * max(avg_long_liq, 10000)
     short_liq_spike = current.get("short_liq", 0) > 3.0 * max(avg_short_liq, 10000)
 
-    # Формируем Алерт для Telegram
     liq_alert = None
     if long_liq_spike:
         liq_alert = "⚠️ <b>ВНИМАНИЕ: Вынос ЛОНГОВ</b>"
@@ -305,8 +312,11 @@ def analyze_orderflow(frame):
     
     for direction in ["LONG", "SHORT"]:
         is_long = direction == "LONG"
-        if is_long and not spot_up: continue
-        if not is_long and not spot_down: continue
+        
+        # Если это паника (слом уровня), мы ослабляем фильтр по споту
+        if not (is_long and panic_breakout) and not (not is_long and panic_breakdown):
+            if is_long and not spot_up: continue
+            if not is_long and not spot_down: continue
 
         sweep = swept_low if is_long else swept_high
         div = bull_div if is_long else bear_div
@@ -318,33 +328,38 @@ def analyze_orderflow(frame):
             rev_liq = long_liq_spike; imp_liq = short_liq_spike
             trap_trigger = short_liq_spike
             trap_confirm = spot_up and rec
+            is_panic_move = panic_breakout
         else:
             rec = current["c"] < current["o"] and current["c"] < prev["c"]
             breakout = current["c"] < prior_low - 0.1 * atr
             rev_liq = short_liq_spike; imp_liq = long_liq_spike
             trap_trigger = long_liq_spike
             trap_confirm = spot_down and rec
+            is_panic_move = panic_breakdown
 
         reversal = bool(rec and (sweep or div) and (absorp or oi_flush or rev_liq))
         impulse = bool(breakout and (perp_up if is_long else perp_down) and oi_buildup and high_vol)
-        
-        # Новая логика: Ловушка после ликвидаций
         liquidation_trap = bool(trap_trigger and trap_confirm and (perp_up if is_long else perp_down))
 
-        if not reversal and not impulse and not liquidation_trap: continue
+        # Разрешаем вход по панике, даже если нет ретеста
+        if not reversal and not impulse and not liquidation_trap and not is_panic_move: continue
 
         score = 5
         reasons = [f"Spot OK ({current['spot_share']*100:.1f}%)"]
         
+        if is_panic_move:
+            score += 2
+            reasons.append("🚨 PANIC SELL/BUY (Слом уровня)")
+
         if liquidation_trap:
             score += 2
-            reasons.append(f"Триггер: {'Вынос шортов' if is_long else 'Вынос лонгов'} + Поток")
+            reasons.append(f"Триггер: {'Вынос шортов' if is_long else 'Вынос лонгов'}")
             
         if div: 
             score += 2 
             reasons.append("Дивергенция CVD")
             
-        if (reversal and rev_liq) or (impulse and imp_liq): 
+        if (reversal and rev_liq) or (impulse and imp_liq) or (is_panic_move and (rev_liq or imp_liq)): 
             score += 2 
             reasons.append("Всплеск ликвидаций")
 
@@ -357,14 +372,14 @@ def analyze_orderflow(frame):
                 elif ratio < 0.7: score -= 1
         
         if (perp_up if is_long else perp_down) or (reversal and absorp): score += 1; reasons.append("Perp OK")
-        if (impulse and oi_buildup) or (reversal and oi_flush): score += 1; reasons.append(f"OI {oi_change:+.2f}%")
+        if (impulse and oi_buildup) or (reversal and oi_flush) or (is_panic_move and oi_change > 0): score += 1; reasons.append(f"OI {oi_change:+.2f}%")
         if high_vol: score += 1; reasons.append("Объем")
         
         if reversal and is_long and funding < -0.01: score += 1; reasons.append("Funding минус")
         if reversal and not is_long and funding > 0.02: score += 1; reasons.append("Funding плюс")
 
         if score >= MIN_SCORE:
-            setup_name = "Ловушка" if liquidation_trap else ("Разворот" if reversal else "Пробой")
+            setup_name = "Паника (Breakdown)" if is_panic_move else ("Ловушка" if liquidation_trap else ("Разворот" if reversal else "Пробой"))
             candidates.append({
                 "direction": direction, 
                 "setup": setup_name, 
@@ -423,7 +438,7 @@ def main():
     state = StateStore()
     cache, processed = {}, set()
 
-    send_telegram("🚀 <b>Order Flow Bot (v2.1) запущен</b>\nСистема Алертов (с датой и временем) активирована.")
+    send_telegram("🚀 <b>Order Flow Bot (v2.2) запущен</b>\nСистема Алертов и Panic Sell активирована.")
     market_map = build_market_map(client)
     if not market_map: raise Exception("Нет монет для торговли")
 
